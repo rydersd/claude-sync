@@ -1,0 +1,10 @@
+{
+  "attribution": {
+    "commits": "Ryder S + Claude",
+    "pullRequests": "Ryder S + Claude"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "$CLAUDE_PROJECT_DIR/.claude/scripts/status.sh"
+  }
+}

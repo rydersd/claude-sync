@@ -1,0 +1,39 @@
+name: ClaudeSync
+options:
+  bundleIdPrefix: com.claudesync
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  ClaudeSync:
+    type: application
+    platform: macOS
+    sources:
+      - path: ClaudeSync
+        excludes:
+          - "**/*.xcassets"
+          - "Info.plist"
+          - "ClaudeSync.entitlements"
+    resources:
+      - path: ClaudeSync/Resources/Assets.xcassets
+    info:
+      path: ClaudeSync/Info.plist
+    entitlements:
+      path: ClaudeSync/ClaudeSync.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.claudesync.app
+        INFOPLIST_FILE: ClaudeSync/Info.plist
+        CODE_SIGN_ENTITLEMENTS: ClaudeSync/ClaudeSync.entitlements
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        COMBINE_HIDPI_IMAGES: true
+        ENABLE_HARDENED_RUNTIME: false

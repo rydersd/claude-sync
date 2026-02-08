@@ -1,0 +1,5 @@
+# Claude Code Plugins
+# Install these after setting up a new machine:
+# claude plugins install <plugin-name>
+#
+# List your installed plugins below:

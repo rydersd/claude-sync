@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# claude-sync runtime (ephemeral directories that may appear in repo/claude)
+claude/cache/
+claude/state/
+claude/telemetry/
+claude/debug/
+claude/statsig/
+claude/plans/
+claude/downloads/
+claude/plugins/
+claude/shell-snapshots/
+claude/paste-cache/
+claude/file-history/
+
+# claude-sync backups
+.claude-sync-backups/
+
+# Claude Code ephemeral state (never commit)
+.claude/cache/
+.claude/state/
+.claude/telemetry/
+.claude/debug/
+.claude/plans/
+.claude/todos/
+.claude/tasks/
+.claude/teams/
+.claude/session-env/
+.claude/shell-snapshots/
+.claude/paste-cache/
+.claude/file-history/
+.claude/downloads/
+.claude/plugins/
+.claude/statsig/
+.claude/history.jsonl
+.claude/stats-cache.json

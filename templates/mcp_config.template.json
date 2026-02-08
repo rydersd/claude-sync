@@ -1,0 +1,12 @@
+{
+  "_comment": "MCP Server Configuration Template. Replace <PLACEHOLDER> values with local paths.",
+  "mcpServers": {
+    "example-server": {
+      "command": "<PATH_TO_BINARY>",
+      "args": ["--port", "3000"],
+      "env": {
+        "API_KEY": "<YOUR_API_KEY>"
+      }
+    }
+  }
+}

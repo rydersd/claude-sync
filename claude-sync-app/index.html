@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Sync</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="header-left">
+        <h1>Claude Sync</h1>
+        <span class="version">v0.1.0</span>
+      </div>
+      <div class="header-right">
+        <span class="status" id="status">
+          <span class="status-dot offline"></span>
+          <span id="status-text">Searching...</span>
+        </span>
+      </div>
+    </header>
+
+    <section id="device-info" class="panel">
+      <div class="panel-header">
+        <h2>This Device</h2>
+      </div>
+      <div class="device-details">
+        <div class="detail-row">
+          <span class="label">Name:</span>
+          <span class="value" id="device-name">Loading...</span>
+        </div>
+        <div class="detail-row">
+          <span class="label">Platform:</span>
+          <span class="value" id="device-platform">--</span>
+        </div>
+        <div class="detail-row">
+          <span class="label">Config files:</span>
+          <span class="value" id="device-file-count">--</span>
+        </div>
+        <div class="detail-row">
+          <span class="label">Fingerprint:</span>
+          <span class="value mono" id="device-fingerprint">--</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="peers" class="panel">
+      <div class="panel-header">
+        <h2>Discovered Machines</h2>
+        <button id="refresh-btn" class="btn-icon" title="Refresh">&#x21bb;</button>
+      </div>
+      <div id="peer-list" class="peer-list">
+        <div class="empty-state" id="no-peers">
+          <p>Scanning local network for Claude Sync peers...</p>
+          <div class="spinner"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="sync-panel" class="panel" style="display:none">
+      <div class="panel-header">
+        <h2>Sync with <span id="peer-name" class="highlight"></span></h2>
+        <button id="close-sync-btn" class="btn-icon" title="Close">&times;</button>
+      </div>
+
+      <div id="diff-summary" class="diff-summary">
+        <div class="diff-loading" id="diff-loading">
+          <div class="spinner"></div>
+          <p>Computing differences...</p>
+        </div>
+        <div id="diff-content" style="display:none">
+          <div class="diff-stats">
+            <span class="stat added" id="stat-added">0 added</span>
+            <span class="stat modified" id="stat-modified">0 modified</span>
+            <span class="stat deleted" id="stat-deleted">0 deleted</span>
+          </div>
+          <div id="diff-file-list" class="diff-file-list"></div>
+        </div>
+        <div id="diff-clean" class="diff-clean" style="display:none">
+          <p>Configurations are in sync. No differences found.</p>
+        </div>
+      </div>
+
+      <div id="actions" class="actions">
+        <button id="push-btn" class="btn btn-push" disabled>
+          Push <span class="arrow">&rarr;</span>
+        </button>
+        <button id="pull-btn" class="btn btn-pull" disabled>
+          <span class="arrow">&larr;</span> Pull
+        </button>
+      </div>
+
+      <div id="sync-progress" class="sync-progress" style="display:none">
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <p id="progress-text">Syncing...</p>
+      </div>
+
+      <div id="sync-result" class="sync-result" style="display:none">
+        <p id="result-text"></p>
+      </div>
+    </section>
+
+    <footer>
+      <span class="footer-text">Peer-to-peer LAN sync for Claude Code configs</span>
+    </footer>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
