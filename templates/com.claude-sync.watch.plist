@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-sync.watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <!-- Update this path to your claude-sync.py location -->
+        <string>/path/to/your/repo/claude-sync.py</string>
+        <string>watch</string>
+        <string>--interval</string>
+        <string>30</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <!-- Update this to your repo root -->
+    <string>/path/to/your/repo</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-sync-watch.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-sync-watch.err</string>
+</dict>
+</plist>

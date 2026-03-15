@@ -1,0 +1,14 @@
+[Unit]
+Description=claude-sync file watcher
+After=network.target
+
+[Service]
+Type=simple
+# Update these paths to your claude-sync.py and repo locations
+ExecStart=/usr/bin/python3 /path/to/your/repo/claude-sync.py watch --interval 30
+WorkingDirectory=/path/to/your/repo
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
