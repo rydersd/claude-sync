@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-sync"
+version = "0.1.0"
+description = "Sync Claude Code configuration between machines via git"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "Claude Sync Contributors" },
+]
+keywords = ["claude", "sync", "config", "dotfiles"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.scripts]
+claude-sync = "claude_sync.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/claudeTools/claude-sync"
+Repository = "https://github.com/claudeTools/claude-sync"
+Issues = "https://github.com/claudeTools/claude-sync/issues"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+include = ["claude_sync*"]
