@@ -34,10 +34,23 @@ python claude-sync.py pull
 
 ## Installation
 
+### Homebrew (recommended)
+
+```bash
+brew tap rydersd/tools
+brew install claude-sync
+```
+
+Updates:
+
+```bash
+brew update && brew upgrade claude-sync
+```
+
 ### Direct (no install needed)
 
 ```bash
-python claude-sync.py <command>
+python3 claude-sync.py <command>
 ```
 
 The script is a single file with zero external dependencies. Python 3.9+ and git are the only requirements.
@@ -68,6 +81,7 @@ This installs the `claude-sync` command globally via the `pyproject.toml` entry 
 | `watch` | Poll for changes and auto-sync (configurable interval). |
 | `hooks` | Install/uninstall git hooks for auto-sync on pull/push. |
 | `ecosystem` | Analyze agents/skills: `duplicates`, `related`, `catalog`, `stats`, `stale`, `timeline`. |
+| `genome` | Skill dependency management: `scan`, `health`, `graph`, `install`, `extract-triggers`, `assemble-triggers`, `package`. |
 | `drift` | Compare local state against known machine versions. |
 
 ### Global Flags
@@ -112,6 +126,100 @@ backup    prune --keep N       Number of backups to retain (default: 5)
 restore   [name]               Backup name (latest if omitted)
           --dry-run            Show what would change without writing
           --yes, -y            Skip confirmation prompt
+genome    scan                 Show all skills with dependency declarations
+          health               Check for missing deps, broken refs, cycles
+          graph [--skill NAME] Visualize dependency tree (tree/flat/dot)
+          install <skill>      Install skill with full dependency resolution
+          extract-triggers     Split skill-rules.json into per-skill files
+          assemble-triggers    Rebuild skill-rules.json from per-skill triggers
+          package <skill>      Export skill + all deps as tar.gz
+```
+
+## Skill Genome
+
+Skill Genome adds dependency management to the skill ecosystem -- think npm for Claude Code skills.
+
+### The Problem
+
+Skills have invisible dependencies. `figma-to-code` needs `design-sync`, which needs `design-tokens`, plus specific agents and MCP servers. Installing a skill means knowing this invisible tree. And the monolithic `skill-rules.json` (65KB+) causes merge conflicts whenever two machines edit different skills.
+
+### How It Works
+
+Skills declare dependencies in their SKILL.md frontmatter:
+
+```yaml
+---
+name: figma-to-code
+description: Deterministic Figma to SwiftUI generation
+version: 1.0.0
+requires:
+  skills: [design-sync, design-tokens]
+  agents: [figma-dev, apple-dev-expert]
+  mcp-servers: [claude_ai_Figma, ClaudeToFigma]
+  rules: [mainactor-safety]
+---
+```
+
+Skills without `requires:` work exactly as before -- fully backward-compatible.
+
+### Atomized Triggers
+
+Instead of one monolithic `skill-rules.json`, each skill owns its own `triggers.json`:
+
+```
+skills/figma-to-code/
+  SKILL.md          <- definition
+  triggers.json     <- just THIS skill's trigger config
+```
+
+`skill-rules.json` becomes a derived artifact, auto-assembled on push/pull. Two machines editing different skills = no merge conflict.
+
+**One-time migration:**
+
+```bash
+claude-sync genome extract-triggers    # splits monolith into per-skill files
+claude-sync genome assemble-triggers   # verify: rebuilds skill-rules.json
+```
+
+### Commands
+
+```bash
+# See what you have
+claude-sync genome scan                        # list all skills + deps
+claude-sync genome health                      # check for missing deps
+
+# Visualize
+claude-sync genome graph --skill figma-to-code # dependency tree
+claude-sync genome graph --skill figma-to-code --format dot  # graphviz
+
+# Install with dependency resolution
+claude-sync genome install figma-to-code       # installs skill + all deps
+
+# Share
+claude-sync genome package figma-to-code       # export as tar.gz
+```
+
+### Install Flow
+
+```
+claude-sync genome install figma-to-code
+
+  Dependency tree:
+    figma-to-code v1.0.0
+      design-sync v1.0.0
+        design-tokens v1.0.0
+      figma-dev (agent)
+      apple-dev-expert (agent)
+      mainactor-safety (rule)
+      claude_ai_Figma (mcp)
+      ClaudeToFigma (mcp)
+
+  Will install 3 skill(s): design-tokens, design-sync, figma-to-code
+  Agents: figma-dev, apple-dev-expert
+  Rules: mainactor-safety
+  MCP servers: claude_ai_Figma, ClaudeToFigma
+
+  Proceed with install? [y/N]
 ```
 
 ## Sync Flow
