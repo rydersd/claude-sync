@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-sync"
-version = "0.1.0"
+version = "1.0.0"
 description = "Sync Claude Code configuration between machines via git"
 readme = "README.md"
 license = "MIT"
@@ -33,9 +33,9 @@ classifiers = [
 claude-sync = "claude_sync.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/claudeTools/claude-sync"
-Repository = "https://github.com/claudeTools/claude-sync"
-Issues = "https://github.com/claudeTools/claude-sync/issues"
+Homepage = "https://github.com/rydersd/claudeTools"
+Repository = "https://github.com/rydersd/claudeTools"
+Issues = "https://github.com/rydersd/claudeTools/issues"
 
 [tool.setuptools]
 py-modules = []

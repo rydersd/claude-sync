@@ -19,6 +19,9 @@ Usage:
     python claude-sync.py watch         Watch for changes and auto-sync
     python claude-sync.py hooks         Install/uninstall git hooks
     python claude-sync.py ecosystem     Ecosystem analysis (duplicates, stats)
+    python claude-sync.py tracker       Manage tracker connections
+    python claude-sync.py pair          Pair with a remote device
+    python claude-sync.py genome        Skill dependency management
 
 Exit codes:
     0 = success
@@ -43,12 +46,21 @@ import signal
 import stat
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Optional: watchdog for OS-native file system events (falls back to polling)
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreatedEvent, FileDeletedEvent
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
 
 
 # =============================================================================
@@ -69,6 +81,7 @@ SYNC_PATHS = [
     "rules/",
     "hooks/",
     "scripts/",
+    "memory/",
 ]
 
 # Paths that NEVER sync
@@ -1169,14 +1182,153 @@ LOCKFILE_PATH = Path.home() / ".claude-sync.lock"
 DEFAULT_WATCH_INTERVAL = 30  # seconds
 
 
+class SyncEventHandler:
+    """Handles OS-native file system events via watchdog with debouncing.
+
+    Collects changed paths within a 500ms debounce window, with a maximum
+    batch duration of 2000ms before forcing a flush.
+
+    Only instantiated when watchdog is available (HAS_WATCHDOG is True).
+    Inherits from FileSystemEventHandler at runtime to avoid import errors.
+    """
+
+    def __init__(self, sync_callback, watch_path: Path, debounce_ms: int = 500):
+        # Inherit from FileSystemEventHandler dynamically to avoid
+        # NameError when watchdog is not installed
+        if HAS_WATCHDOG:
+            FileSystemEventHandler.__init__(self)
+        self.sync_callback = sync_callback
+        self.watch_path = watch_path
+        self.debounce_ms = debounce_ms
+        self._pending_changes: set = set()
+        self._debounce_timer: Optional[threading.Timer] = None
+        self._first_event_time: Optional[float] = None
+        self._max_batch_ms = 2000  # Force flush after 2s of accumulated events
+        self._lock = threading.Lock()
+
+    def _is_syncable(self, path: str) -> bool:
+        """Check if a file change is for a syncable path."""
+        try:
+            abs_path = Path(path)
+            rel = str(abs_path.relative_to(self.watch_path))
+        except ValueError:
+            return False
+
+        # Check against EXCLUDE_PATHS first
+        for excl in EXCLUDE_PATHS:
+            if excl.endswith("/"):
+                dir_name = excl.rstrip("/")
+                if rel == dir_name or rel.startswith(dir_name + "/"):
+                    return False
+            else:
+                if rel == excl:
+                    return False
+
+        # Check walk exclusion patterns
+        for part in Path(rel).parts:
+            for pattern in WALK_EXCLUDE_PATTERNS:
+                if fnmatch.fnmatch(part, pattern):
+                    return False
+
+        # Check against SYNC_PATHS
+        for sync_path in SYNC_PATHS:
+            if sync_path.endswith("/"):
+                prefix = sync_path.rstrip("/")
+                if rel.startswith(prefix + "/") or rel == prefix:
+                    return True
+            else:
+                if rel == sync_path:
+                    return True
+
+        # settings.json is also syncable
+        if rel == "settings.json":
+            return True
+
+        return False
+
+    def on_modified(self, event):
+        if not event.is_directory and self._is_syncable(event.src_path):
+            self._add_change(event.src_path)
+
+    def on_created(self, event):
+        if not event.is_directory and self._is_syncable(event.src_path):
+            self._add_change(event.src_path)
+
+    def on_deleted(self, event):
+        if not event.is_directory and self._is_syncable(event.src_path):
+            self._add_change(event.src_path)
+
+    def _add_change(self, path: str):
+        """Add a changed path with debouncing: 500ms window, 2s max batch."""
+        with self._lock:
+            self._pending_changes.add(path)
+            now = time.time() * 1000  # milliseconds
+
+            if self._first_event_time is None:
+                self._first_event_time = now
+
+            # Force flush if 2s since first event in this batch
+            if now - self._first_event_time >= self._max_batch_ms:
+                self._flush()
+                return
+
+            # Reset/start debounce timer
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+            self._debounce_timer = threading.Timer(
+                self.debounce_ms / 1000.0, self._flush
+            )
+            self._debounce_timer.daemon = True
+            self._debounce_timer.start()
+
+    def _flush(self):
+        """Flush pending changes to the sync callback."""
+        with self._lock:
+            if self._pending_changes:
+                changes = self._pending_changes.copy()
+                self._pending_changes.clear()
+                self._first_event_time = None
+                if self._debounce_timer:
+                    self._debounce_timer.cancel()
+                    self._debounce_timer = None
+                # Call sync in a thread to avoid blocking the observer
+                threading.Thread(
+                    target=self.sync_callback, args=(changes,), daemon=True
+                ).start()
+
+    def stop(self):
+        """Cancel any pending debounce timer."""
+        with self._lock:
+            if self._debounce_timer:
+                self._debounce_timer.cancel()
+                self._debounce_timer = None
+
+
+# Build SyncEventHandler's base class dynamically so it works even without watchdog
+if HAS_WATCHDOG:
+    # Re-create the class with proper inheritance from FileSystemEventHandler
+    _OrigSyncEventHandler = SyncEventHandler
+    class SyncEventHandler(FileSystemEventHandler, _OrigSyncEventHandler):  # type: ignore[no-redef]
+        """Watchdog-aware event handler with debounced sync callback."""
+        def __init__(self, *args, **kwargs):
+            FileSystemEventHandler.__init__(self)
+            _OrigSyncEventHandler.__init__(self, *args, **kwargs)
+
+
 class FileWatcher:
-    """Polling-based file watcher with lockfile management."""
+    """Watches for file changes and triggers sync.
+
+    Uses watchdog for OS-native file system events if available,
+    falls back to polling otherwise.
+    """
 
     def __init__(self, paths: PathResolver, output: Output, interval: int = DEFAULT_WATCH_INTERVAL):
         self.paths = paths
         self.output = output
         self.interval = interval
         self._running = False
+        self._use_watchdog = HAS_WATCHDOG
+        # Polling-specific state
         self._last_home_mtimes: Dict[str, float] = {}
         self._last_repo_mtimes: Dict[str, float] = {}
 
@@ -1203,6 +1355,116 @@ class FileWatcher:
         except (ValueError, OSError):
             LOCKFILE_PATH.unlink(missing_ok=True)
 
+    def watch(self) -> int:
+        """Run the watch loop. Returns exit code.
+
+        Automatically selects watchdog (OS-native events) or polling
+        based on whether the watchdog library is available.
+        """
+        if not self._acquire_lock():
+            self.output.error("Another claude-sync watcher is already running.")
+            return ExitCode.ERROR
+
+        self._running = True
+
+        def _signal_handler(signum, frame):
+            self._running = False
+
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+
+        try:
+            if self._use_watchdog:
+                return self._watch_with_watchdog()
+            else:
+                return self._watch_with_polling()
+        finally:
+            self._release_lock()
+            self.output.info("Watcher stopped.")
+
+    def _watch_with_watchdog(self) -> int:
+        """Watch using OS-native file system events via watchdog."""
+        self.output.info("Watching for changes via watchdog (OS-native events)... (Ctrl+C to stop)")
+
+        handler = SyncEventHandler(
+            sync_callback=self._handle_watchdog_changes,
+            watch_path=self.paths.home_claude,
+        )
+        observer = Observer()
+        observer.schedule(handler, str(self.paths.home_claude), recursive=True)
+
+        # Also watch repo/claude if it exists
+        repo_handler = None
+        if self.paths.repo_claude and self.paths.repo_claude.exists():
+            repo_handler = SyncEventHandler(
+                sync_callback=self._handle_watchdog_changes,
+                watch_path=self.paths.repo_claude,
+            )
+            observer.schedule(repo_handler, str(self.paths.repo_claude), recursive=True)
+
+        observer.start()
+        try:
+            while self._running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self._running = False
+        finally:
+            handler.stop()
+            if repo_handler:
+                repo_handler.stop()
+            observer.stop()
+            observer.join()
+
+        return ExitCode.OK
+
+    def _handle_watchdog_changes(self, changed_paths: set) -> None:
+        """Handle a batch of changed files detected by watchdog.
+
+        Determines whether the changes are in home or repo, computes
+        a diff, and syncs accordingly.
+        """
+        # Classify changes as home or repo
+        home_changed = False
+        repo_changed = False
+        for p in changed_paths:
+            abs_p = Path(p)
+            try:
+                abs_p.relative_to(self.paths.home_claude)
+                home_changed = True
+            except ValueError:
+                pass
+            if self.paths.repo_claude:
+                try:
+                    abs_p.relative_to(self.paths.repo_claude)
+                    repo_changed = True
+                except ValueError:
+                    pass
+
+        if not home_changed and not repo_changed:
+            return
+
+        # Perform the same sync logic as the polling path
+        self._do_sync(home_changed, repo_changed)
+
+    def _watch_with_polling(self) -> int:
+        """Fallback: polling-based file watching."""
+        self.output.info(f"Watching for changes every {self.interval}s (polling)... (Ctrl+C to stop)")
+
+        # Initial mtime snapshot
+        self._last_home_mtimes = self._collect_mtimes(self.paths.home_claude)
+        self._last_repo_mtimes = self._collect_mtimes(self.paths.repo_claude)
+
+        try:
+            while self._running:
+                time.sleep(self.interval)
+                if not self._running:
+                    break
+                self._check_and_sync_polling()
+        except KeyboardInterrupt:
+            self._running = False
+
+        return ExitCode.OK
+
     def _collect_mtimes(self, base_dir: Path) -> Dict[str, float]:
         """Collect modification times for syncable files."""
         mtimes = {}
@@ -1224,39 +1486,8 @@ class FileWatcher:
             return True
         return any(old_mtimes[k] != new_mtimes[k] for k in old_mtimes)
 
-    def watch(self) -> int:
-        """Run the watch loop. Returns exit code."""
-        if not self._acquire_lock():
-            self.output.error("Another claude-sync watcher is already running.")
-            return ExitCode.ERROR
-
-        self._running = True
-        self.output.info(f"Watching for changes every {self.interval}s... (Ctrl+C to stop)")
-
-        # Initial mtime snapshot
-        self._last_home_mtimes = self._collect_mtimes(self.paths.home_claude)
-        self._last_repo_mtimes = self._collect_mtimes(self.paths.repo_claude)
-
-        def _signal_handler(signum, frame):
-            self._running = False
-
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-
-        try:
-            while self._running:
-                time.sleep(self.interval)
-                if not self._running:
-                    break
-                self._check_and_sync()
-        finally:
-            self._release_lock()
-            self.output.info("Watcher stopped.")
-
-        return ExitCode.OK
-
-    def _check_and_sync(self) -> None:
-        """Check for changes and trigger sync if needed."""
+    def _check_and_sync_polling(self) -> None:
+        """Check for changes via polling and trigger sync if needed."""
         new_home_mtimes = self._collect_mtimes(self.paths.home_claude)
         new_repo_mtimes = self._collect_mtimes(self.paths.repo_claude)
 
@@ -1266,6 +1497,14 @@ class FileWatcher:
         if not home_changed and not repo_changed:
             return
 
+        self._do_sync(home_changed, repo_changed)
+
+        # Update mtime snapshots
+        self._last_home_mtimes = self._collect_mtimes(self.paths.home_claude)
+        self._last_repo_mtimes = self._collect_mtimes(self.paths.repo_claude)
+
+    def _do_sync(self, home_changed: bool, repo_changed: bool) -> None:
+        """Core sync logic shared by both watchdog and polling watchers."""
         # Load manifest for three-way merge
         manifest = Manifest.load(self.paths.manifest_path)
         base_hashes = manifest.files if manifest.files else None
@@ -1306,10 +1545,6 @@ class FileWatcher:
                 manifest.record_file_history(changed_paths, "pull", new_home_hashes)
                 manifest.save(self.paths.manifest_path)
                 self.output.success(f"[{self._timestamp()}] Auto-pulled {count} file(s)")
-
-        # Update mtime snapshots
-        self._last_home_mtimes = self._collect_mtimes(self.paths.home_claude)
-        self._last_repo_mtimes = self._collect_mtimes(self.paths.repo_claude)
 
     @staticmethod
     def _timestamp() -> str:
@@ -1399,6 +1634,168 @@ class GitHookManager:
 
 
 # =============================================================================
+# Tracker / Pairing Configuration
+# =============================================================================
+
+class SyncConfig:
+    """Manages ~/.claude/sync-config.json for tracker and pairing configuration."""
+
+    CONFIG_PATH = Path.home() / ".claude" / "sync-config.json"
+
+    DEFAULT: Dict[str, Any] = {
+        "trackers": [],
+        "auto_sync": {"enabled": True, "debounce_ms": 500},
+        "security": {"require_pairing": True, "allow_unpaired_lan": True},
+    }
+
+    @classmethod
+    def load(cls) -> Dict[str, Any]:
+        """Load sync config from disk, returning defaults if not present."""
+        if cls.CONFIG_PATH.exists():
+            try:
+                return json.loads(cls.CONFIG_PATH.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return copy.deepcopy(cls.DEFAULT)
+
+    @classmethod
+    def save(cls, config: Dict[str, Any]) -> None:
+        """Persist sync config to disk."""
+        cls.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cls.CONFIG_PATH.write_text(
+            json.dumps(config, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def add_tracker(cls, url: str, name: str) -> None:
+        """Add a tracker server to the configuration."""
+        config = cls.load()
+        # Check for duplicates
+        if any(t["url"] == url for t in config["trackers"]):
+            print(f"  Tracker already configured: {url}")
+            return
+        config["trackers"].append({"url": url, "name": name, "enabled": True})
+        cls.save(config)
+        print(f"  Added tracker: {name} ({url})")
+
+    @classmethod
+    def remove_tracker(cls, url: str) -> None:
+        """Remove a tracker server from the configuration."""
+        config = cls.load()
+        before = len(config["trackers"])
+        config["trackers"] = [t for t in config["trackers"] if t["url"] != url]
+        if len(config["trackers"]) == before:
+            print(f"  Tracker not found: {url}")
+            return
+        cls.save(config)
+        print(f"  Removed tracker: {url}")
+
+    @classmethod
+    def list_trackers(cls) -> None:
+        """Print all configured trackers."""
+        config = cls.load()
+        if not config["trackers"]:
+            print("  No trackers configured.")
+            print("  Use 'claude-sync tracker add <url> --name <name>' to add one.")
+            return
+        for t in config["trackers"]:
+            status = "enabled" if t.get("enabled", True) else "disabled"
+            print(f"  {t['name']} ({t['url']}) [{status}]")
+
+    @classmethod
+    def toggle_tracker(cls, url: str, enabled: bool) -> None:
+        """Enable or disable a tracker by URL."""
+        config = cls.load()
+        for t in config["trackers"]:
+            if t["url"] == url:
+                t["enabled"] = enabled
+                cls.save(config)
+                state = "Enabled" if enabled else "Disabled"
+                print(f"  {state} tracker: {url}")
+                return
+        print(f"  Tracker not found: {url}")
+
+
+def handle_tracker_command(args) -> int:
+    """Dispatch tracker subcommands."""
+    cmd = getattr(args, "tracker_command", None)
+    if cmd == "add":
+        SyncConfig.add_tracker(args.url, args.name)
+    elif cmd == "remove":
+        SyncConfig.remove_tracker(args.url)
+    elif cmd == "list":
+        SyncConfig.list_trackers()
+    elif cmd == "enable":
+        SyncConfig.toggle_tracker(args.url, True)
+    elif cmd == "disable":
+        SyncConfig.toggle_tracker(args.url, False)
+    else:
+        print("  Tracker commands:")
+        print("    claude-sync tracker add <url> --name <name>   Add a tracker")
+        print("    claude-sync tracker remove <url>              Remove a tracker")
+        print("    claude-sync tracker list                      List trackers")
+        print("    claude-sync tracker enable <url>              Enable a tracker")
+        print("    claude-sync tracker disable <url>             Disable a tracker")
+    return ExitCode.OK
+
+
+def handle_pair_command(args, output: Output) -> int:
+    """Handle the pair subcommand for device pairing."""
+    device_id = getattr(args, "device_id", None)
+    code = getattr(args, "code", None)
+
+    if not device_id:
+        # Generate a pairing code for this device
+        my_id = f"{platform.node()}-{uuid.getnode()}"
+        pairing_code = hashlib.sha256(
+            f"{my_id}-{time.time()}".encode()
+        ).hexdigest()[:8].upper()
+        output.header("Device pairing")
+        output.info(f"  Device ID:    {my_id}")
+        output.info(f"  Pairing code: {pairing_code}")
+        output.info("")
+        output.info("  On the other device, run:")
+        output.info(f"    claude-sync pair {my_id} --code {pairing_code}")
+
+        # Store the pending pairing
+        config = SyncConfig.load()
+        if "pending_pairings" not in config:
+            config["pending_pairings"] = {}
+        config["pending_pairings"][pairing_code] = {
+            "device_id": my_id,
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+        SyncConfig.save(config)
+        return ExitCode.OK
+    else:
+        # Complete a pairing with a remote device
+        if not code:
+            output.error("Pairing code required. Use --code <code>")
+            return ExitCode.ERROR
+
+        my_id = f"{platform.node()}-{uuid.getnode()}"
+        config = SyncConfig.load()
+        if "paired_devices" not in config:
+            config["paired_devices"] = []
+
+        # Check for duplicate
+        if any(d["device_id"] == device_id for d in config["paired_devices"]):
+            output.warning(f"Already paired with device: {device_id}")
+            return ExitCode.OK
+
+        config["paired_devices"].append({
+            "device_id": device_id,
+            "pairing_code": code,
+            "paired_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "paired_by": my_id,
+        })
+        SyncConfig.save(config)
+        output.success(f"Paired with device: {device_id}")
+        return ExitCode.OK
+
+
+# =============================================================================
 # Phase 6: Ecosystem Intelligence
 # =============================================================================
 
@@ -1417,6 +1814,616 @@ class SimilarityPair:
             "score": round(self.score, 3),
             "breakdown": {k: round(v, 3) for k, v in self.breakdown.items()},
         }
+
+
+# =============================================================================
+# Phase 7: Skill Genome
+# =============================================================================
+
+@dataclass
+class SkillDependencies:
+    """Dependencies declared by a skill."""
+    skills: List[str] = field(default_factory=list)
+    agents: List[str] = field(default_factory=list)
+    mcp_servers: List[str] = field(default_factory=list)
+    rules: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "skills": self.skills,
+            "agents": self.agents,
+            "mcp_servers": self.mcp_servers,
+            "rules": self.rules,
+        }
+
+    @property
+    def has_any(self) -> bool:
+        return bool(self.skills or self.agents or self.mcp_servers or self.rules)
+
+
+@dataclass
+class SkillGenome:
+    """Complete genome of a skill: metadata + dependencies + triggers."""
+    name: str
+    description: str
+    version: str
+    user_invocable: bool
+    allowed_tools: List[str]
+    requires: SkillDependencies
+    triggers: Optional[Dict] = None
+    path: str = ""
+
+    def to_dict(self) -> dict:
+        d = {
+            "name": self.name,
+            "description": self.description,
+            "version": self.version,
+            "user_invocable": self.user_invocable,
+            "allowed_tools": self.allowed_tools,
+            "requires": self.requires.to_dict(),
+            "path": self.path,
+        }
+        if self.triggers:
+            d["triggers"] = self.triggers
+        return d
+
+
+@dataclass
+class DependencyNode:
+    """A node in the cross-type dependency graph."""
+    name: str
+    node_type: str          # "skill", "agent", "mcp_server", "rule"
+    exists: bool
+    dependents: List[str] = field(default_factory=list)
+    dependencies: List[str] = field(default_factory=list)
+
+
+@dataclass
+class HealthIssue:
+    """A dependency health problem."""
+    skill_name: str
+    issue_type: str         # "missing_skill", "missing_agent", "missing_mcp", etc.
+    message: str
+    severity: str           # "error", "warning", "info"
+    remediation: str
+
+    def to_dict(self) -> dict:
+        return {
+            "skill_name": self.skill_name,
+            "issue_type": self.issue_type,
+            "message": self.message,
+            "severity": self.severity,
+            "remediation": self.remediation,
+        }
+
+
+class SkillGenomeEngine:
+    """Dependency resolution and health checking for the skill ecosystem."""
+
+    def __init__(self, home_dir: Path, repo_dir: Optional[Path] = None):
+        self.home_dir = home_dir
+        self.repo_dir = repo_dir
+        self._genome_cache: Dict[str, SkillGenome] = {}
+
+    @staticmethod
+    def _parse_inline_list(val: str) -> List[str]:
+        """Parse [a, b, c] inline list format."""
+        val = val.strip()
+        if val.startswith("[") and val.endswith("]"):
+            items = val[1:-1].split(",")
+            return [item.strip().strip('"').strip("'") for item in items if item.strip()]
+        return [val] if val else []
+
+    def _parse_genome_frontmatter(self, content: str) -> Dict:
+        """Parse SKILL.md frontmatter including nested requires: block.
+
+        Purpose-built for skill frontmatter schema. Handles inline lists
+        [a, b, c] and block-style indented sub-keys under requires:.
+        """
+        meta: Dict[str, Any] = {}
+        if not content.startswith("---"):
+            return meta
+        end = content.find("---", 3)
+        if end <= 0:
+            return meta
+
+        fm = content[3:end]
+        current_section: Optional[str] = None
+
+        for line in fm.strip().splitlines():
+            if not line.strip():
+                continue
+
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+
+            if ":" not in stripped:
+                continue
+
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+
+            if indent == 0:
+                if key == "requires" and not val:
+                    current_section = "requires"
+                    meta["requires"] = {}
+                else:
+                    current_section = None
+                    if val.startswith("["):
+                        meta[key] = self._parse_inline_list(val)
+                    else:
+                        meta[key] = val.strip('"').strip("'")
+            elif indent > 0 and current_section == "requires":
+                meta.setdefault("requires", {})[key] = self._parse_inline_list(val)
+
+        return meta
+
+    def parse_genome(self, skill_dir: Path) -> Optional[SkillGenome]:
+        """Parse a skill directory into a SkillGenome."""
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            return None
+
+        content = skill_md.read_text(encoding="utf-8", errors="replace")
+        meta = self._parse_genome_frontmatter(content)
+
+        name = meta.get("name", skill_dir.name)
+        if isinstance(name, list):
+            name = name[0] if name else skill_dir.name
+        desc = meta.get("description", "")
+        if isinstance(desc, list):
+            desc = desc[0] if desc else ""
+        version = meta.get("version", "0.0.0")
+        if isinstance(version, list):
+            version = version[0] if version else "0.0.0"
+        user_invocable = str(
+            meta.get("user_invocable", meta.get("user-invocable", "false"))
+        ).lower() == "true"
+
+        allowed_tools = meta.get("allowed-tools", [])
+        if isinstance(allowed_tools, str):
+            allowed_tools = self._parse_inline_list(allowed_tools)
+
+        requires_raw = meta.get("requires", {})
+        if not isinstance(requires_raw, dict):
+            requires_raw = {}
+        requires = SkillDependencies(
+            skills=requires_raw.get("skills", []),
+            agents=requires_raw.get("agents", []),
+            mcp_servers=requires_raw.get("mcp-servers", requires_raw.get("mcp_servers", [])),
+            rules=requires_raw.get("rules", []),
+        )
+
+        # Load triggers.json if it exists
+        triggers = None
+        triggers_path = skill_dir / "triggers.json"
+        if triggers_path.exists():
+            try:
+                with open(triggers_path) as f:
+                    triggers = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        return SkillGenome(
+            name=name,
+            description=desc,
+            version=version,
+            user_invocable=user_invocable,
+            allowed_tools=allowed_tools if isinstance(allowed_tools, list) else [],
+            requires=requires,
+            triggers=triggers,
+            path=f"skills/{skill_dir.name}/SKILL.md",
+        )
+
+    def scan_all(self, base_dir: Optional[Path] = None) -> Dict[str, SkillGenome]:
+        """Scan all skill directories and return genomes."""
+        if self._genome_cache and base_dir is None:
+            return self._genome_cache
+
+        search_dir = base_dir or self.home_dir
+        skills_dir = search_dir / "skills"
+        if not skills_dir.exists():
+            return {}
+
+        result: Dict[str, SkillGenome] = {}
+        for entry in sorted(skills_dir.iterdir()):
+            if entry.is_dir() and not entry.name.startswith((".", "_")):
+                genome = self.parse_genome(entry)
+                if genome:
+                    result[genome.name] = genome
+
+        if base_dir is None:
+            self._genome_cache = result
+        return result
+
+    def resolve_dependencies(self, skill_name: str,
+                             genomes: Optional[Dict[str, SkillGenome]] = None
+                             ) -> Tuple[List[str], List[str]]:
+        """Resolve dependency tree using DFS post-order topological sort.
+        Returns (install_order, cycles). install_order has deps first."""
+        if genomes is None:
+            genomes = self.scan_all()
+
+        visited: Set[str] = set()
+        in_stack: Set[str] = set()
+        result: List[str] = []
+        cycles: List[str] = []
+
+        def dfs(name: str) -> None:
+            if name in visited:
+                return
+            if name in in_stack:
+                cycles.append(name)
+                return
+            in_stack.add(name)
+
+            genome = genomes.get(name)
+            if genome:
+                for dep in genome.requires.skills:
+                    dfs(dep)
+
+            in_stack.discard(name)
+            visited.add(name)
+            result.append(name)
+
+        dfs(skill_name)
+        return result, cycles
+
+    def build_full_graph(self, genomes: Optional[Dict[str, SkillGenome]] = None
+                         ) -> Dict[str, DependencyNode]:
+        """Build complete cross-type dependency graph (skills + agents + MCP + rules)."""
+        if genomes is None:
+            genomes = self.scan_all()
+
+        graph: Dict[str, DependencyNode] = {}
+
+        for name, genome in genomes.items():
+            skill_key = f"skill:{name}"
+            if skill_key not in graph:
+                graph[skill_key] = DependencyNode(
+                    name=name, node_type="skill", exists=True,
+                )
+
+            for dep_skill in genome.requires.skills:
+                dep_key = f"skill:{dep_skill}"
+                graph[skill_key].dependencies.append(dep_key)
+                if dep_key not in graph:
+                    graph[dep_key] = DependencyNode(
+                        name=dep_skill, node_type="skill",
+                        exists=dep_skill in genomes,
+                    )
+                graph[dep_key].dependents.append(skill_key)
+
+            for dep_agent in genome.requires.agents:
+                dep_key = f"agent:{dep_agent}"
+                graph[skill_key].dependencies.append(dep_key)
+                if dep_key not in graph:
+                    agent_path = self.home_dir / "agents" / f"{dep_agent}.md"
+                    graph[dep_key] = DependencyNode(
+                        name=dep_agent, node_type="agent",
+                        exists=agent_path.exists(),
+                    )
+                graph[dep_key].dependents.append(skill_key)
+
+            for dep_mcp in genome.requires.mcp_servers:
+                dep_key = f"mcp:{dep_mcp}"
+                graph[skill_key].dependencies.append(dep_key)
+                if dep_key not in graph:
+                    graph[dep_key] = DependencyNode(
+                        name=dep_mcp, node_type="mcp_server",
+                        exists=self._mcp_server_exists(dep_mcp),
+                    )
+                graph[dep_key].dependents.append(skill_key)
+
+            for dep_rule in genome.requires.rules:
+                dep_key = f"rule:{dep_rule}"
+                graph[skill_key].dependencies.append(dep_key)
+                if dep_key not in graph:
+                    rule_path = self.home_dir / "rules" / f"{dep_rule}.md"
+                    graph[dep_key] = DependencyNode(
+                        name=dep_rule, node_type="rule",
+                        exists=rule_path.exists(),
+                    )
+                graph[dep_key].dependents.append(skill_key)
+
+        return graph
+
+    def check_health(self, genomes: Optional[Dict[str, SkillGenome]] = None
+                     ) -> List[HealthIssue]:
+        """Verify all declared dependencies exist."""
+        if genomes is None:
+            genomes = self.scan_all()
+
+        issues: List[HealthIssue] = []
+        graph = self.build_full_graph(genomes)
+
+        # Missing dependencies
+        for key, node in sorted(graph.items()):
+            if not node.exists and node.dependents:
+                dependent_names = [
+                    graph[d].name for d in node.dependents if d in graph
+                ]
+                issues.append(HealthIssue(
+                    skill_name=", ".join(dependent_names),
+                    issue_type=f"missing_{node.node_type}",
+                    message=f"{node.node_type} '{node.name}' required but not found",
+                    severity="error" if node.node_type in ("skill", "agent") else "warning",
+                    remediation=self._remediation_for(node),
+                ))
+
+        # Circular dependencies
+        checked_cycles: Set[str] = set()
+        for name in genomes:
+            _, cycles = self.resolve_dependencies(name, genomes)
+            for c in cycles:
+                if c not in checked_cycles:
+                    checked_cycles.add(c)
+                    issues.append(HealthIssue(
+                        skill_name=name,
+                        issue_type="circular_dependency",
+                        message=f"Circular dependency detected involving '{c}'",
+                        severity="error",
+                        remediation="Remove or restructure the circular skill dependencies",
+                    ))
+
+        return issues
+
+    @staticmethod
+    def _remediation_for(node: DependencyNode) -> str:
+        if node.node_type == "skill":
+            return f"Install skill '{node.name}' or remove from requires"
+        elif node.node_type == "agent":
+            return f"Create agents/{node.name}.md or remove from requires"
+        elif node.node_type == "mcp_server":
+            return f"Add '{node.name}' to mcp_config.json or remove from requires"
+        elif node.node_type == "rule":
+            return f"Create rules/{node.name}.md or remove from requires"
+        return "Check dependency configuration"
+
+    def _mcp_server_exists(self, name: str) -> bool:
+        """Check if an MCP server is configured in mcp_config.json."""
+        mcp_path = self.home_dir / "mcp_config.json"
+        if not mcp_path.exists():
+            return False
+        try:
+            with open(mcp_path) as f:
+                config = json.load(f)
+            return name in config.get("mcpServers", {})
+        except (json.JSONDecodeError, OSError):
+            return False
+
+    def extract_triggers(self, skill_rules_path: Path) -> Dict[str, int]:
+        """Split monolith skill-rules.json into per-skill triggers.json files.
+        Returns {"extracted": N, "skipped": N, "agent_triggers": N}."""
+        if not skill_rules_path.exists():
+            return {"extracted": 0, "skipped": 0, "agent_triggers": 0}
+
+        with open(skill_rules_path) as f:
+            rules = json.load(f)
+
+        skills_section = rules.get("skills", {})
+        agents_section = rules.get("agents", {})
+        skills_dir = skill_rules_path.parent
+
+        extracted = 0
+        skipped = 0
+
+        for skill_name, config in skills_section.items():
+            skill_dir = skills_dir / skill_name
+            if not skill_dir.is_dir():
+                skipped += 1
+                continue
+
+            triggers_path = skill_dir / "triggers.json"
+            with open(triggers_path, "w") as f:
+                json.dump(config, f, indent=2, sort_keys=True)
+                f.write("\n")
+            extracted += 1
+
+        agent_count = 0
+        if agents_section:
+            agent_triggers_path = skills_dir / "_agent-triggers.json"
+            with open(agent_triggers_path, "w") as f:
+                json.dump(agents_section, f, indent=2, sort_keys=True)
+                f.write("\n")
+            agent_count = len(agents_section)
+
+        return {"extracted": extracted, "skipped": skipped, "agent_triggers": agent_count}
+
+    def assemble_triggers(self, skills_dir: Path) -> Dict:
+        """Rebuild skill-rules.json from per-skill triggers.json files."""
+        skills_section: Dict[str, Any] = {}
+        agents_section: Dict[str, Any] = {}
+
+        for entry in sorted(skills_dir.iterdir()):
+            if entry.is_dir() and not entry.name.startswith((".", "_")):
+                triggers_path = entry / "triggers.json"
+                if triggers_path.exists():
+                    try:
+                        with open(triggers_path) as f:
+                            skills_section[entry.name] = json.load(f)
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+        agent_triggers_path = skills_dir / "_agent-triggers.json"
+        if agent_triggers_path.exists():
+            try:
+                with open(agent_triggers_path) as f:
+                    agents_section = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        return {
+            "version": "1.0",
+            "description": "Skill activation triggers for Claude Code (assembled from per-skill triggers)",
+            "skills": skills_section,
+            "agents": agents_section,
+            "notes": {
+                "assembled": True,
+                "source": "Per-skill triggers.json files",
+            },
+        }
+
+    def has_atomized_triggers(self, skills_dir: Path) -> bool:
+        """Check if any per-skill triggers.json files exist."""
+        if not skills_dir.exists():
+            return False
+        for entry in skills_dir.iterdir():
+            if entry.is_dir() and (entry / "triggers.json").exists():
+                return True
+        return False
+
+    def format_tree(self, skill_name: str, genomes: Dict[str, SkillGenome],
+                    indent: int = 0, visited: Optional[Set[str]] = None) -> List[str]:
+        """Format dependency tree as indented text lines."""
+        if visited is None:
+            visited = set()
+        lines: List[str] = []
+        genome = genomes.get(skill_name)
+        prefix = "  " * indent
+        marker = "├── " if indent > 0 else ""
+
+        version_tag = f" v{genome.version}" if genome and genome.version != "0.0.0" else ""
+        lines.append(f"{prefix}{marker}{skill_name}{version_tag}")
+
+        if skill_name in visited:
+            return lines
+        visited.add(skill_name)
+
+        if genome:
+            sub_indent = indent + 1
+            sub_prefix = "  " * sub_indent
+
+            for dep in genome.requires.skills:
+                if dep in genomes:
+                    lines.extend(self.format_tree(dep, genomes, sub_indent, visited))
+                else:
+                    lines.append(f"{sub_prefix}├── {dep} (missing)")
+
+            for agent in genome.requires.agents:
+                lines.append(f"{sub_prefix}├── {agent} (agent)")
+
+            for mcp in genome.requires.mcp_servers:
+                lines.append(f"{sub_prefix}├── {mcp} (mcp)")
+
+            for rule in genome.requires.rules:
+                lines.append(f"{sub_prefix}├── {rule} (rule)")
+
+        return lines
+
+    def package_skill(self, skill_name: str, genomes: Dict[str, SkillGenome],
+                      output_path: Path) -> List[str]:
+        """Package a skill + all deps as tar.gz. Returns included file list."""
+        import tarfile
+
+        install_order, cycles = self.resolve_dependencies(skill_name, genomes)
+        if cycles:
+            raise ValueError(f"Cannot package: circular dependencies involving {cycles}")
+
+        included: List[str] = []
+        added_arcnames: Set[str] = set()
+
+        with tarfile.open(output_path, "w:gz") as tar:
+            for name in install_order:
+                genome = genomes.get(name)
+                skill_dir = self.home_dir / "skills" / name
+                if skill_dir.is_dir():
+                    for fpath in sorted(skill_dir.rglob("*")):
+                        if fpath.is_file():
+                            arcname = str(fpath.relative_to(self.home_dir))
+                            if arcname not in added_arcnames:
+                                tar.add(fpath, arcname=arcname)
+                                included.append(arcname)
+                                added_arcnames.add(arcname)
+
+                if not genome:
+                    continue
+                for agent_name in genome.requires.agents:
+                    agent_path = self.home_dir / "agents" / f"{agent_name}.md"
+                    if agent_path.exists():
+                        arcname = str(agent_path.relative_to(self.home_dir))
+                        if arcname not in added_arcnames:
+                            tar.add(agent_path, arcname=arcname)
+                            included.append(arcname)
+                            added_arcnames.add(arcname)
+
+                for rule_name in genome.requires.rules:
+                    rule_path = self.home_dir / "rules" / f"{rule_name}.md"
+                    if rule_path.exists():
+                        arcname = str(rule_path.relative_to(self.home_dir))
+                        if arcname not in added_arcnames:
+                            tar.add(rule_path, arcname=arcname)
+                            included.append(arcname)
+                            added_arcnames.add(arcname)
+
+        return included
+
+    def install_skill(self, skill_name: str, repo_dir: Path, home_dir: Path,
+                      genomes: Dict[str, SkillGenome]
+                      ) -> Tuple[List[str], List[str]]:
+        """Install a skill + deps from repo to home.
+        Returns (installed_paths, warnings)."""
+        install_order, cycles = self.resolve_dependencies(skill_name, genomes)
+        if cycles:
+            raise ValueError(f"Cannot install: circular dependencies involving {cycles}")
+
+        # Validate all deps exist in repo BEFORE copying
+        missing: List[str] = []
+        for name in install_order:
+            if not (repo_dir / "skills" / name).is_dir():
+                missing.append(f"skills/{name}/")
+
+        genome = genomes.get(skill_name)
+        warnings: List[str] = []
+        if genome:
+            for agent_name in genome.requires.agents:
+                if not (repo_dir / "agents" / f"{agent_name}.md").exists():
+                    missing.append(f"agents/{agent_name}.md")
+            for rule_name in genome.requires.rules:
+                if not (repo_dir / "rules" / f"{rule_name}.md").exists():
+                    missing.append(f"rules/{rule_name}.md")
+            for mcp_name in genome.requires.mcp_servers:
+                if not self._mcp_server_exists(mcp_name):
+                    warnings.append(
+                        f"MCP server '{mcp_name}' not in mcp_config.json "
+                        f"— add it to use {skill_name}"
+                    )
+
+        if missing:
+            raise FileNotFoundError(f"Missing in repo: {', '.join(missing)}")
+
+        # Copy atomically (all skills, then agents, then rules)
+        installed: List[str] = []
+        for name in install_order:
+            src_dir = repo_dir / "skills" / name
+            dst_dir = home_dir / "skills" / name
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            for fpath in sorted(src_dir.rglob("*")):
+                if fpath.is_file():
+                    rel = fpath.relative_to(src_dir)
+                    dest = dst_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(fpath, dest)
+            installed.append(f"skills/{name}/")
+
+        if genome:
+            for agent_name in genome.requires.agents:
+                src = repo_dir / "agents" / f"{agent_name}.md"
+                if src.exists():
+                    dest = home_dir / "agents" / f"{agent_name}.md"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                    installed.append(f"agents/{agent_name}.md")
+            for rule_name in genome.requires.rules:
+                src = repo_dir / "rules" / f"{rule_name}.md"
+                if src.exists():
+                    dest = home_dir / "rules" / f"{rule_name}.md"
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dest)
+                    installed.append(f"rules/{rule_name}.md")
+
+        return installed, warnings
 
 
 class EcosystemAnalyzer:
@@ -1736,6 +2743,9 @@ class ClaudeSync:
             "hooks": self._cmd_hooks,
             "ecosystem": self._cmd_ecosystem,
             "drift": self._cmd_drift,
+            "tracker": self._cmd_tracker,
+            "pair": self._cmd_pair,
+            "genome": self._cmd_genome,
         }
         handler = handlers.get(self.args.command)
         if handler:
@@ -1824,9 +2834,12 @@ class ClaudeSync:
         restore_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
         # watch
-        watch_p = subparsers.add_parser("watch", help="Watch for changes and auto-sync")
+        watch_p = subparsers.add_parser(
+            "watch",
+            help="Watch for changes and auto-sync (uses watchdog if installed, falls back to polling)",
+        )
         watch_p.add_argument("--interval", type=int, default=DEFAULT_WATCH_INTERVAL,
-                            help=f"Poll interval in seconds (default: {DEFAULT_WATCH_INTERVAL})")
+                            help=f"Poll interval in seconds for fallback mode (default: {DEFAULT_WATCH_INTERVAL})")
 
         # hooks
         hooks_p = subparsers.add_parser("hooks", help="Install/uninstall git hooks for auto-sync")
@@ -1860,6 +2873,56 @@ class ClaudeSync:
 
         # drift
         subparsers.add_parser("drift", help="Compare local state against known machine versions")
+
+        # tracker
+        tracker_parser = subparsers.add_parser("tracker", help="Manage tracker connections")
+        tracker_sub = tracker_parser.add_subparsers(dest="tracker_command")
+
+        tracker_add = tracker_sub.add_parser("add", help="Add a tracker server")
+        tracker_add.add_argument("url", help="Tracker WebSocket URL (wss://...)")
+        tracker_add.add_argument("--name", required=True, help="Human-readable name")
+
+        tracker_remove = tracker_sub.add_parser("remove", help="Remove a tracker server")
+        tracker_remove.add_argument("url", help="Tracker URL to remove")
+
+        tracker_sub.add_parser("list", help="List configured trackers")
+
+        tracker_enable = tracker_sub.add_parser("enable", help="Enable a tracker")
+        tracker_enable.add_argument("url", help="Tracker URL to enable")
+
+        tracker_disable = tracker_sub.add_parser("disable", help="Disable a tracker")
+        tracker_disable.add_argument("url", help="Tracker URL to disable")
+
+        # pair
+        pair_parser = subparsers.add_parser("pair", help="Pair with a remote device")
+        pair_parser.add_argument("device_id", nargs="?", help="Device ID to pair with")
+        pair_parser.add_argument("--code", help="Pairing code from the other device")
+
+        # genome
+        genome_parser = subparsers.add_parser("genome", help="Skill dependency management")
+        genome_sub = genome_parser.add_subparsers(dest="genome_command")
+
+        genome_sub.add_parser("scan", help="Show all skills with dependency declarations")
+
+        genome_sub.add_parser("health", help="Check for missing deps, broken refs, cycles")
+
+        graph_p = genome_sub.add_parser("graph", help="Visualize dependency tree")
+        graph_p.add_argument("--skill", help="Show tree for specific skill")
+        graph_p.add_argument("--format", choices=["tree", "flat", "dot"], default="tree",
+                             help="Output format (default: tree)")
+
+        install_p = genome_sub.add_parser("install", help="Install skill with dependency resolution")
+        install_p.add_argument("skill", help="Skill name to install")
+
+        genome_sub.add_parser("extract-triggers",
+                              help="One-time migration: split skill-rules.json into per-skill files")
+
+        genome_sub.add_parser("assemble-triggers",
+                              help="Rebuild skill-rules.json from per-skill triggers")
+
+        package_p = genome_sub.add_parser("package", help="Export skill + deps as tar.gz")
+        package_p.add_argument("skill", help="Skill name to package")
+        package_p.add_argument("--output", "-o", help="Output path (default: <skill>.tar.gz)")
 
         return parser
 
@@ -2063,6 +3126,9 @@ class ClaudeSync:
             home_hashes, repo_hashes, "push", base_hashes=base_hashes
         )
 
+        # Filter derived artifacts (skill-rules.json) when atomized triggers exist
+        self._filter_derived_artifacts(diff_result)
+
         # Handle conflicts
         if diff_result.has_conflicts:
             self.output.warning(f"\n  {len(diff_result.conflicted)} conflict(s) detected "
@@ -2158,6 +3224,9 @@ class ClaudeSync:
         manifest.record_file_history(changed_paths, "push", new_repo_hashes)
         manifest.save(self.paths.manifest_path)
 
+        # Reassemble derived artifacts after push
+        self._maybe_assemble_triggers(target="repo")
+
         self.output.success(f"Pushed {count} file(s)")
 
         if self.output.json_mode:
@@ -2190,6 +3259,9 @@ class ClaudeSync:
         diff_result = DiffEngine.compare(
             home_hashes, repo_hashes, "pull", base_hashes=base_hashes
         )
+
+        # Filter derived artifacts (skill-rules.json) when atomized triggers exist
+        self._filter_derived_artifacts(diff_result)
 
         # Handle conflicts
         if diff_result.has_conflicts:
@@ -2287,6 +3359,9 @@ class ClaudeSync:
         manifest.update_provenance("pull")
         manifest.record_file_history(changed_paths, "pull", new_home_hashes)
         manifest.save(self.paths.manifest_path)
+
+        # Reassemble derived artifacts after pull
+        self._maybe_assemble_triggers(target="home")
 
         self.output.success(f"Pulled {count} file(s)")
 
@@ -2908,6 +3983,14 @@ class ClaudeSync:
 
         return ExitCode.OK
 
+    def _cmd_tracker(self) -> int:
+        """Manage tracker connections."""
+        return handle_tracker_command(self.args)
+
+    def _cmd_pair(self) -> int:
+        """Pair with a remote device."""
+        return handle_pair_command(self.args, self.output)
+
     def _cmd_resolve(self) -> int:
         """Show and resolve sync conflicts interactively."""
         if not self._require_init():
@@ -3043,6 +4126,377 @@ class ClaudeSync:
                 self.output.set_json("total_tracked_files", len(manifest.file_history))
 
         return ExitCode.OK
+
+
+    # -------------------------------------------------------------------------
+    # Genome commands
+    # -------------------------------------------------------------------------
+
+    def _cmd_genome(self) -> int:
+        """Skill Genome: dependency management for the skill ecosystem."""
+        sub = getattr(self.args, "genome_command", None)
+        if not sub:
+            self.output.error(
+                "Usage: claude-sync genome "
+                "{scan|health|graph|install|extract-triggers|assemble-triggers|package}"
+            )
+            return ExitCode.ERROR
+
+        genome_handlers = {
+            "scan": self._genome_scan,
+            "health": self._genome_health,
+            "graph": self._genome_graph,
+            "install": self._genome_install,
+            "extract-triggers": self._genome_extract_triggers,
+            "assemble-triggers": self._genome_assemble_triggers,
+            "package": self._genome_package,
+        }
+        handler = genome_handlers.get(sub)
+        if handler:
+            return handler()
+        self.output.error(f"Unknown genome command: {sub}")
+        return ExitCode.ERROR
+
+    def _genome_scan(self) -> int:
+        """Show all skills with their dependency declarations."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        genomes = engine.scan_all()
+
+        if not genomes:
+            self.output.warning("No skills found")
+            return ExitCode.OK
+
+        self.output.header(f"Skill Genome Scan ({len(genomes)} skills)")
+
+        with_deps = {n: g for n, g in genomes.items() if g.requires.has_any}
+        without_deps = {n: g for n, g in genomes.items() if not g.requires.has_any}
+
+        if with_deps:
+            self.output.info(f"\nSkills with dependencies ({len(with_deps)}):")
+            for name, genome in sorted(with_deps.items()):
+                version = f" v{genome.version}" if genome.version != "0.0.0" else ""
+                self.output.info(f"  {name}{version}")
+                r = genome.requires
+                if r.skills:
+                    self.output.detail(f"    skills: {', '.join(r.skills)}")
+                if r.agents:
+                    self.output.detail(f"    agents: {', '.join(r.agents)}")
+                if r.mcp_servers:
+                    self.output.detail(f"    mcp-servers: {', '.join(r.mcp_servers)}")
+                if r.rules:
+                    self.output.detail(f"    rules: {', '.join(r.rules)}")
+
+        if without_deps:
+            self.output.info(f"\nSkills without dependencies ({len(without_deps)}):")
+            for name in sorted(without_deps):
+                self.output.detail(f"  {name}")
+
+        if self.output.json_mode:
+            self.output.set_json("skills", {n: g.to_dict() for n, g in genomes.items()})
+            self.output.set_json("total", len(genomes))
+            self.output.set_json("with_deps", len(with_deps))
+
+        return ExitCode.OK
+
+    def _genome_health(self) -> int:
+        """Check for missing deps, broken MCP refs, circular chains."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        genomes = engine.scan_all()
+        issues = engine.check_health(genomes)
+
+        self.output.header(f"Skill Genome Health ({len(genomes)} skills)")
+
+        if not issues:
+            self.output.success("All dependency checks passed")
+        else:
+            errors = [i for i in issues if i.severity == "error"]
+            warnings = [i for i in issues if i.severity == "warning"]
+
+            if errors:
+                self.output.info(f"\nErrors ({len(errors)}):")
+                for issue in errors:
+                    self.output.error(f"  {issue.message}")
+                    self.output.detail(f"    Affects: {issue.skill_name}")
+                    self.output.detail(f"    Fix: {issue.remediation}")
+
+            if warnings:
+                self.output.info(f"\nWarnings ({len(warnings)}):")
+                for issue in warnings:
+                    self.output.warning(f"  {issue.message}")
+                    self.output.detail(f"    Affects: {issue.skill_name}")
+                    self.output.detail(f"    Fix: {issue.remediation}")
+
+        if self.output.json_mode:
+            self.output.set_json("issues", [i.to_dict() for i in issues])
+            self.output.set_json("error_count", len([i for i in issues if i.severity == "error"]))
+            self.output.set_json("warning_count", len([i for i in issues if i.severity == "warning"]))
+
+        return ExitCode.OK if not any(i.severity == "error" for i in issues) else ExitCode.ERROR
+
+    def _genome_graph(self) -> int:
+        """Visualize dependency tree."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        genomes = engine.scan_all()
+        skill_name = getattr(self.args, "skill", None)
+        fmt = getattr(self.args, "format", "tree")
+
+        if skill_name:
+            if skill_name not in genomes:
+                self.output.error(f"Skill '{skill_name}' not found")
+                return ExitCode.ERROR
+
+            self.output.header(f"Dependency tree: {skill_name}")
+
+            if fmt == "tree":
+                lines = engine.format_tree(skill_name, genomes)
+                for line in lines:
+                    self.output.info(line)
+            elif fmt == "flat":
+                order, cycles = engine.resolve_dependencies(skill_name, genomes)
+                self.output.info("Install order (deps first):")
+                for i, name in enumerate(order, 1):
+                    self.output.info(f"  {i}. {name}")
+                if cycles:
+                    self.output.warning(f"Cycles detected: {', '.join(cycles)}")
+            elif fmt == "dot":
+                self.output.info("digraph genome {")
+                self.output.info("  rankdir=LR;")
+                order, _ = engine.resolve_dependencies(skill_name, genomes)
+                for name in order:
+                    g = genomes.get(name)
+                    if g:
+                        for dep in g.requires.skills:
+                            self.output.info(f'  "{name}" -> "{dep}";')
+                        for agent in g.requires.agents:
+                            self.output.info(f'  "{name}" -> "{agent}" [style=dashed];')
+                        for mcp in g.requires.mcp_servers:
+                            self.output.info(f'  "{name}" -> "{mcp}" [style=dotted];')
+                self.output.info("}")
+        else:
+            self.output.header("Full dependency graph")
+            graph = engine.build_full_graph(genomes)
+            for key, node in sorted(graph.items()):
+                if node.dependencies or node.dependents:
+                    deps = ", ".join(node.dependencies) if node.dependencies else "none"
+                    status = "exists" if node.exists else "MISSING"
+                    self.output.info(f"  {key} [{status}] -> {deps}")
+
+        if self.output.json_mode:
+            if skill_name:
+                order, cycles = engine.resolve_dependencies(skill_name, genomes)
+                self.output.set_json("skill", skill_name)
+                self.output.set_json("install_order", order)
+                self.output.set_json("cycles", cycles)
+            else:
+                graph = engine.build_full_graph(genomes)
+                self.output.set_json("graph", {
+                    k: {"name": v.name, "type": v.node_type, "exists": v.exists,
+                        "deps": v.dependencies, "dependents": v.dependents}
+                    for k, v in graph.items()
+                })
+
+        return ExitCode.OK
+
+    def _genome_install(self) -> int:
+        """Install skill with full dependency resolution."""
+        if not self._require_init():
+            return ExitCode.NOT_INITIALIZED
+
+        skill_name = self.args.skill
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+
+        # Scan from repo (that's where we install FROM)
+        genomes = engine.scan_all(self.paths.repo_claude)
+        if skill_name not in genomes:
+            self.output.error(f"Skill '{skill_name}' not found in repo")
+            return ExitCode.ERROR
+
+        # Show install plan
+        order, cycles = engine.resolve_dependencies(skill_name, genomes)
+        if cycles:
+            self.output.error(f"Circular dependencies: {', '.join(cycles)}")
+            return ExitCode.ERROR
+
+        self.output.header(f"Install plan for '{skill_name}'")
+        self.output.info("\nDependency tree:")
+        for line in engine.format_tree(skill_name, genomes):
+            self.output.info(f"  {line}")
+
+        self.output.info(f"\nWill install {len(order)} skill(s): {', '.join(order)}")
+
+        genome = genomes[skill_name]
+        if genome.requires.agents:
+            self.output.info(f"Agents: {', '.join(genome.requires.agents)}")
+        if genome.requires.rules:
+            self.output.info(f"Rules: {', '.join(genome.requires.rules)}")
+        if genome.requires.mcp_servers:
+            self.output.info(f"MCP servers: {', '.join(genome.requires.mcp_servers)}")
+
+        if not self.output.confirm("\nProceed with install?"):
+            self.output.info("Cancelled")
+            return ExitCode.OK
+
+        try:
+            installed, warnings = engine.install_skill(
+                skill_name, self.paths.repo_claude, self.paths.home_claude, genomes
+            )
+        except (FileNotFoundError, ValueError) as e:
+            self.output.error(str(e))
+            return ExitCode.ERROR
+
+        # Assemble triggers after install
+        self._maybe_assemble_triggers(target="home")
+
+        for path in installed:
+            self.output.file_added(path)
+        for warn in warnings:
+            self.output.warning(warn)
+
+        self.output.success(f"Installed {len(installed)} item(s)")
+
+        if self.output.json_mode:
+            self.output.set_json("installed", installed)
+            self.output.set_json("warnings", warnings)
+
+        return ExitCode.OK
+
+    def _genome_extract_triggers(self) -> int:
+        """One-time migration: split skill-rules.json into per-skill files."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        rules_path = self.paths.home_claude / "skills" / "skill-rules.json"
+
+        if not rules_path.exists():
+            self.output.error(f"skill-rules.json not found at {rules_path}")
+            return ExitCode.ERROR
+
+        self.output.header("Extract triggers from skill-rules.json")
+        counts = engine.extract_triggers(rules_path)
+
+        self.output.success(
+            f"Extracted {counts['extracted']} trigger(s) to per-skill files"
+        )
+        if counts["skipped"]:
+            self.output.warning(
+                f"Skipped {counts['skipped']} skill(s) (no matching directory)"
+            )
+        if counts["agent_triggers"]:
+            self.output.info(
+                f"Wrote {counts['agent_triggers']} agent trigger(s) to _agent-triggers.json"
+            )
+        self.output.info(
+            "\nskill-rules.json is now a derived artifact. "
+            "It will be auto-assembled from per-skill triggers.json files on push/pull."
+        )
+
+        if self.output.json_mode:
+            self.output.set_json("counts", counts)
+
+        return ExitCode.OK
+
+    def _genome_assemble_triggers(self) -> int:
+        """Rebuild skill-rules.json from per-skill triggers.json files."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        skills_dir = self.paths.home_claude / "skills"
+
+        if not engine.has_atomized_triggers(skills_dir):
+            self.output.warning("No per-skill triggers.json files found")
+            self.output.info("Run 'claude-sync genome extract-triggers' first")
+            return ExitCode.ERROR
+
+        assembled = engine.assemble_triggers(skills_dir)
+        rules_path = skills_dir / "skill-rules.json"
+        with open(rules_path, "w") as f:
+            json.dump(assembled, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+        skill_count = len(assembled.get("skills", {}))
+        agent_count = len(assembled.get("agents", {}))
+        self.output.success(
+            f"Assembled skill-rules.json: {skill_count} skills, {agent_count} agents"
+        )
+
+        if self.output.json_mode:
+            self.output.set_json("skills", skill_count)
+            self.output.set_json("agents", agent_count)
+
+        return ExitCode.OK
+
+    def _genome_package(self) -> int:
+        """Export skill + all deps as shareable tar.gz."""
+        skill_name = self.args.skill
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        genomes = engine.scan_all()
+
+        if skill_name not in genomes:
+            self.output.error(f"Skill '{skill_name}' not found")
+            return ExitCode.ERROR
+
+        output_path = getattr(self.args, "output", None)
+        if not output_path:
+            output_path = f"{skill_name}.tar.gz"
+        output_path = Path(output_path)
+
+        self.output.header(f"Packaging '{skill_name}'")
+
+        try:
+            included = engine.package_skill(skill_name, genomes, output_path)
+        except ValueError as e:
+            self.output.error(str(e))
+            return ExitCode.ERROR
+
+        for path in included:
+            self.output.detail(f"  + {path}")
+        self.output.success(f"Packaged {len(included)} file(s) to {output_path}")
+
+        if self.output.json_mode:
+            self.output.set_json("output", str(output_path))
+            self.output.set_json("files", included)
+
+        return ExitCode.OK
+
+    def _maybe_assemble_triggers(self, target: str = "both") -> None:
+        """Reassemble skill-rules.json from per-skill triggers if they exist."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+
+        if target in ("home", "both"):
+            home_skills = self.paths.home_claude / "skills"
+            if engine.has_atomized_triggers(home_skills):
+                assembled = engine.assemble_triggers(home_skills)
+                rules_path = home_skills / "skill-rules.json"
+                with open(rules_path, "w") as f:
+                    json.dump(assembled, f, indent=2, sort_keys=True)
+                    f.write("\n")
+                self.output.detail("Assembled skill-rules.json from per-skill triggers (home)")
+
+        if target in ("repo", "both") and self.paths.repo_claude:
+            repo_skills = self.paths.repo_claude / "skills"
+            if engine.has_atomized_triggers(repo_skills):
+                assembled = engine.assemble_triggers(repo_skills)
+                rules_path = repo_skills / "skill-rules.json"
+                with open(rules_path, "w") as f:
+                    json.dump(assembled, f, indent=2, sort_keys=True)
+                    f.write("\n")
+                self.output.detail("Assembled skill-rules.json from per-skill triggers (repo)")
+
+    def _filter_derived_artifacts(self, diff_result: DiffResult) -> bool:
+        """Remove derived artifacts (skill-rules.json) from diff when atomized triggers exist.
+        Returns True if filtering was applied."""
+        engine = SkillGenomeEngine(self.paths.home_claude, self.paths.repo_claude)
+        home_skills = self.paths.home_claude / "skills"
+        repo_skills = self.paths.repo_claude / "skills" if self.paths.repo_claude else None
+
+        has_atomized = engine.has_atomized_triggers(home_skills) or (
+            repo_skills is not None and engine.has_atomized_triggers(repo_skills)
+        )
+        if not has_atomized:
+            return False
+
+        derived = "skills/skill-rules.json"
+        diff_result.added = [c for c in diff_result.added if c.path != derived]
+        diff_result.modified = [c for c in diff_result.modified if c.path != derived]
+        diff_result.deleted = [c for c in diff_result.deleted if c.path != derived]
+        diff_result.conflicted = [c for c in diff_result.conflicted if c.path != derived]
+        return True
 
 
 # =============================================================================
