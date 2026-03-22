@@ -58,7 +58,7 @@ class TestSecretScannerPatterns(unittest.TestCase):
 
     def test_pattern_aws_key(self):
         """Detects AWS access key IDs (AKIA/ASIA prefix + 16 chars)."""
-        findings = self._scan_content("aws_key = AKIAIOSFODNN7EXAMPLE")
+        findings = self._scan_content("aws_key = AKIAIOSFODNN7A2B3C4D")
         self.assertTrue(any("AWS" in f.pattern_name for f in findings))
 
     def test_pattern_github_token(self):
@@ -101,13 +101,11 @@ class TestSecretScannerFalsePositives(unittest.TestCase):
         self.assertEqual(len(pwd_findings), 0)
 
     def test_commented_placeholder(self):
-        """Placeholder-like content 'sk-placeholder' is still detected (it matches regex)."""
-        # NOTE: The scanner is intentionally conservative - it flags even placeholders
-        # because it can't distinguish real vs. placeholder values reliably.
+        """Placeholder-like content 'sk-placeholder' is filtered out by placeholder detection."""
         findings = self._scan_content("# key: sk-placeholder1234567890abcdef")
-        # This WILL match because the regex doesn't check for placeholders
         sk_findings = [f for f in findings if "API Key" in f.pattern_name]
-        self.assertTrue(len(sk_findings) > 0)
+        # Placeholder indicator skips the line
+        self.assertEqual(len(sk_findings), 0)
 
     def test_no_false_positive_on_normal_markdown(self):
         """Normal markdown documentation should not trigger any patterns."""
