@@ -5292,7 +5292,7 @@ class ClaudeSync:
         }
 
         # Parse agent/skill frontmatter using EcosystemAnalyzer's approach
-        for path, _ in home_hashes.items():
+        for path in home_hashes:
             full_path = self.paths.home_claude / path
             if not full_path.exists():
                 continue

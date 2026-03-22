@@ -8,6 +8,7 @@ from conftest import claude_sync
 SettingsMerger = claude_sync.SettingsMerger
 PORTABLE_SETTINGS_KEYS = claude_sync.PORTABLE_SETTINGS_KEYS
 MACHINE_SPECIFIC_KEYS = claude_sync.MACHINE_SPECIFIC_KEYS
+RECOMMENDED_ENV_KEYS = claude_sync.RECOMMENDED_ENV_KEYS
 
 
 class TestExtractPortable(unittest.TestCase):
@@ -20,12 +21,14 @@ class TestExtractPortable(unittest.TestCase):
             "env": {"PATH": "/usr/bin"},
             "permissions": {"allow": []},
             "attribution": True,
+            "mcpServers": {"server1": {}},
         }
         portable = SettingsMerger.extract_portable(settings)
         self.assertIn("hooks", portable)
         self.assertIn("attribution", portable)
-        self.assertNotIn("env", portable)
-        self.assertNotIn("permissions", portable)
+        self.assertIn("permissions", portable)
+        self.assertNotIn("env", portable)  # No recommended env keys present
+        self.assertNotIn("mcpServers", portable)
 
     def test_missing_portable_keys_skipped(self):
         """Keys not present in input are simply absent from output."""
@@ -52,6 +55,34 @@ class TestExtractPortable(unittest.TestCase):
     def test_empty_settings(self):
         """Empty settings yields empty portable."""
         self.assertEqual(SettingsMerger.extract_portable({}), {})
+
+    def test_extracts_recommended_env_keys(self):
+        """Recommended env keys are extracted from the env block."""
+        settings = {
+            "env": {
+                "PATH": "/usr/bin",
+                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+            },
+        }
+        portable = SettingsMerger.extract_portable(settings)
+        self.assertIn("env", portable)
+        self.assertIn("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", portable["env"])
+        self.assertNotIn("PATH", portable["env"])
+
+    def test_no_recommended_env_keys_means_no_env_in_portable(self):
+        """If no recommended env keys present, env is not in portable."""
+        settings = {"env": {"PATH": "/usr/bin", "HOME": "/Users/me"}}
+        portable = SettingsMerger.extract_portable(settings)
+        self.assertNotIn("env", portable)
+
+    def test_extracts_teammate_mode_and_theme(self):
+        """teammateMode and theme are portable keys."""
+        settings = {"teammateMode": "tmux", "theme": "dark"}
+        portable = SettingsMerger.extract_portable(settings)
+        self.assertIn("teammateMode", portable)
+        self.assertEqual(portable["teammateMode"], "tmux")
+        self.assertIn("theme", portable)
+        self.assertEqual(portable["theme"], "dark")
 
 
 class TestDeepMerge(unittest.TestCase):
@@ -126,12 +157,14 @@ class TestMergeForPush(unittest.TestCase):
             "env": {"SECRET": "val"},
             "permissions": {"allow": ["Read"]},
             "statusLine": True,
+            "mcpServers": {"server1": {}},
         }
         result = SettingsMerger.merge_for_push(home)
         self.assertIn("hooks", result)
         self.assertIn("statusLine", result)
-        self.assertNotIn("env", result)
-        self.assertNotIn("permissions", result)
+        self.assertIn("permissions", result)
+        self.assertNotIn("mcpServers", result)
+        self.assertNotIn("env", result)  # No recommended env keys present
 
     def test_push_empty_settings(self):
         """Pushing empty settings returns empty dict."""
@@ -181,6 +214,39 @@ class TestMergeForPull(unittest.TestCase):
         result = SettingsMerger.merge_for_pull(local, repo)
         self.assertEqual(result["hooks"]["pre"], ["cmd"])
         self.assertTrue(result["statusLine"])
+
+    def test_pull_merges_recommended_env_keys(self):
+        """Pull merges recommended env keys without clobbering local env."""
+        local = {
+            "env": {"PATH": "/local", "HOME": "/Users/me"},
+        }
+        repo = {
+            "hooks": {"pre": ["cmd"]},
+            "env": {
+                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+                "SHOULD_BE_IGNORED": "yes",
+            },
+        }
+        result = SettingsMerger.merge_for_pull(local, repo)
+        # Local env keys preserved
+        self.assertEqual(result["env"]["PATH"], "/local")
+        self.assertEqual(result["env"]["HOME"], "/Users/me")
+        # Recommended env key merged
+        self.assertEqual(result["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1")
+        # Non-recommended env key NOT merged
+        self.assertNotIn("SHOULD_BE_IGNORED", result["env"])
+        # Portable key merged
+        self.assertIn("hooks", result)
+
+    def test_pull_creates_env_if_missing_locally(self):
+        """Pull creates env block if local has none but remote has recommended keys."""
+        local = {"hooks": {"old": True}}
+        repo = {
+            "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+        }
+        result = SettingsMerger.merge_for_pull(local, repo)
+        self.assertIn("env", result)
+        self.assertEqual(result["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1")
 
     def test_pull_does_not_mutate_local(self):
         """merge_for_pull doesn't modify the local settings input."""

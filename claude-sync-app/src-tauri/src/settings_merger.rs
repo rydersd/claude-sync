@@ -76,16 +76,23 @@ pub fn merge_for_push(home_settings: &Value) -> Value {
 /// Prepare settings for pull: merge remote portable keys into local settings.
 /// Machine-specific keys in local_settings are preserved.
 pub fn merge_for_pull(local_settings: &Value, repo_settings: &Value) -> Value {
-    let portable = extract_portable(repo_settings);
+    let mut portable = extract_portable(repo_settings);
+    // Pop env from portable before deep merge — env needs surgical key-level merge,
+    // not wholesale replacement (which would clobber local-only env vars).
+    let remote_rec_env = portable.as_object_mut()
+        .and_then(|m| m.remove("env"));
     let mut result = deep_merge(local_settings, &portable);
-    // Merge recommended env keys without clobbering local env
-    if let Some(Value::Object(remote_env)) = portable.as_object().and_then(|m| m.get("env")) {
-        let result_obj = result.as_object_mut().unwrap();
-        let local_env = result_obj.entry("env").or_insert_with(|| Value::Object(Map::new()));
-        if let Value::Object(local_env_map) = local_env {
-            for key in RECOMMENDED_ENV_KEYS {
-                if let Some(value) = remote_env.get(*key) {
-                    local_env_map.insert(key.to_string(), value.clone());
+    // Merge only recommended env keys into local env without clobbering
+    if let Some(Value::Object(rec_env)) = remote_rec_env {
+        if let Some(result_obj) = result.as_object_mut() {
+            let local_env = result_obj
+                .entry("env")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(local_env_map) = local_env {
+                for key in RECOMMENDED_ENV_KEYS {
+                    if let Some(value) = rec_env.get(*key) {
+                        local_env_map.insert(key.to_string(), value.clone());
+                    }
                 }
             }
         }

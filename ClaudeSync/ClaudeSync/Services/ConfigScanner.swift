@@ -39,6 +39,7 @@ actor ConfigScanner {
         "worksets/",
         "plugins/",
         "keybindings.json",
+        ".claude-sync-capabilities.json",
     ]
 
     /// Paths that are explicitly excluded from sync.

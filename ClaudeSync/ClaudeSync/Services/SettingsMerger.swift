@@ -115,11 +115,14 @@ enum SettingsMerger {
     ) -> [String: Any] {
         // Start with local settings (preserves machine-specific keys).
         // Only merge the portable keys from remote.
-        let portableOnly = extractPortable(from: remotePortableSettings)
+        var portableOnly = extractPortable(from: remotePortableSettings)
+        // Pop env from portable before deep merge — env needs surgical key-level merge,
+        // not wholesale replacement (which would clobber local-only env vars).
+        let remoteRecEnv = portableOnly.removeValue(forKey: "env") as? [String: Any]
         var result = deepMerge(base: localSettings, overlay: portableOnly)
 
-        // Merge recommended env keys without clobbering local env
-        if let remoteEnv = portableOnly["env"] as? [String: Any] {
+        // Merge only recommended env keys into local env without clobbering
+        if let remoteEnv = remoteRecEnv {
             var localEnv = result["env"] as? [String: Any] ?? [:]
             for key in recommendedEnvKeys {
                 if let value = remoteEnv[key] {

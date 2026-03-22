@@ -228,8 +228,9 @@ async fn flush_batch(
 }
 
 /// Filter function: only fire for files that belong to syncable paths.
-/// Matches: rules/*.md, skills/**/* , hooks/**/* , CLAUDE.md, settings.json, memory/**/*
-/// Excludes: .credentials, projects/, cache/, statsig/, hidden files starting with '.'
+/// Matches: agents/, skills/, rules/, hooks/, scripts/, memory/, worksets/, plugins/,
+///          CLAUDE.md, settings.json, keybindings.json
+/// Excludes: .credentials, projects/, cache/, statsig/, teams/, tasks/, hidden files
 pub fn is_syncable_path(path: &str) -> bool {
     // Exclude hidden files (except CLAUDE.md at root, which doesn't start with '.')
     let filename = path.rsplit('/').next().unwrap_or(path);

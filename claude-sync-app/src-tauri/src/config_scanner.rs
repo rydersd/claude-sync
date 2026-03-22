@@ -28,6 +28,7 @@ const SYNC_PATHS: &[&str] = &[
     "worksets/",
     "plugins/",
     "keybindings.json",
+    ".claude-sync-capabilities.json",
 ];
 
 /// Paths that are always excluded from syncing. Matches Python tool's EXCLUDE_PATHS.
