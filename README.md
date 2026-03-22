@@ -52,7 +52,7 @@ python claude-sync.py pull
 ### Homebrew (recommended)
 
 ```bash
-brew tap rydersd/tools
+brew tap rydersd/claude-sync https://github.com/rydersd/claude-sync
 brew install claude-sync
 ```
 
