@@ -161,15 +161,16 @@ final class ServiceAdvertiser: @unchecked Sendable {
         }
     }
 
-    /// Builds the Bonjour TXT record dictionary containing peer metadata.
+    /// Builds the Bonjour TXT record dictionary per PROTOCOL.md Section 2.2.
     private func buildTXTRecord() -> NWTXTRecord {
         var txtRecord = NWTXTRecord()
-        txtRecord["version"] = "1"
-        txtRecord["device_id"] = deviceId
+        txtRecord["v"] = "1"
+        txtRecord["id"] = deviceId
         txtRecord["name"] = deviceName
         txtRecord["configs"] = String(configCount)
         txtRecord["fingerprint"] = String(fingerprint.prefix(16))
-        txtRecord["platform"] = "macOS"
+        txtRecord["platform"] = "macos"
+        txtRecord["app_version"] = "1.0.0"
         return txtRecord
     }
 }

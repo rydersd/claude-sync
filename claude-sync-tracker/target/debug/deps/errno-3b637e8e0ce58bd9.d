@@ -1,0 +1,6 @@
+/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/debug/deps/errno-3b637e8e0ce58bd9.d: /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs
+
+/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/debug/deps/liberrno-3b637e8e0ce58bd9.rmeta: /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs
+
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs:
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/unix.rs:

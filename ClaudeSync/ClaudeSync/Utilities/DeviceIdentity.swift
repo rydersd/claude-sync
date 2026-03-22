@@ -2,28 +2,48 @@
 // ClaudeSync
 //
 // Generates and persists a unique device UUID for this machine.
-// The UUID is stored in UserDefaults and reused across app launches.
-// Also provides the human-readable device name from the system hostname.
+// Per PROTOCOL.md Section 2.4, the UUID is stored at:
+//   macOS: ~/Library/Application Support/claude-sync/device-id
+// It is stable across app restarts, OS reboots, and app updates.
 
 import Foundation
 
 /// Manages the persistent device identity used for Bonjour advertisement
-/// and peer identification. The UUID is generated once and stored in
-/// UserDefaults so it survives app restarts.
+/// and peer identification. The UUID is generated once and persisted to
+/// a file so it survives app restarts.
 enum DeviceIdentity {
 
-    /// UserDefaults key for the persisted device UUID.
-    private static let deviceIdKey = "com.claudesync.deviceId"
+    /// Directory for device identity storage.
+    private static let storageDirectory: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("claude-sync")
+    }()
+
+    /// File path for the persisted device UUID.
+    private static let deviceIdFile: URL = {
+        storageDirectory.appendingPathComponent("device-id")
+    }()
 
     /// Returns the persistent device UUID, generating one if this is the first launch.
-    /// Thread-safe because UserDefaults is thread-safe for reads/writes.
+    /// Thread-safe via file system atomicity.
     static var deviceId: String {
-        if let existing = UserDefaults.standard.string(forKey: deviceIdKey) {
+        // Try to read existing device ID from file.
+        if let existing = try? String(contentsOf: deviceIdFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           !existing.isEmpty {
             return existing
         }
 
+        // Generate a new UUID and persist it.
         let newId = UUID().uuidString.lowercased()
-        UserDefaults.standard.set(newId, forKey: deviceIdKey)
+
+        do {
+            try FileManager.default.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
+            try newId.write(to: deviceIdFile, atomically: true, encoding: .utf8)
+        } catch {
+            // If we can't persist, return the generated ID anyway.
+            // It will be regenerated next launch, which is acceptable for first-run edge cases.
+        }
+
         return newId
     }
 
@@ -40,13 +60,14 @@ enum DeviceIdentity {
     }
 
     /// Returns a short description of the platform for TXT record metadata.
+    /// Lowercase per PROTOCOL.md TXT record spec.
     static var platform: String {
-        return "macOS"
+        return "macos"
     }
 
     /// Resets the device ID. Only used for testing purposes.
     /// After calling this, the next access to deviceId will generate a new UUID.
     static func resetDeviceId() {
-        UserDefaults.standard.removeObject(forKey: deviceIdKey)
+        try? FileManager.default.removeItem(at: deviceIdFile)
     }
 }

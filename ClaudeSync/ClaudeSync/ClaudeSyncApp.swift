@@ -1,9 +1,9 @@
 // ClaudeSyncApp.swift
-// ClaudeSync - Peer-to-peer LAN config sync for Claude Code
+// ClaudeSync - Peer-to-peer config sync for Claude Code
 //
-// App entry point. Menu bar only application using MenuBarExtra with window style.
-// No dock icon (LSUIElement = YES). Owns the NetworkManager and starts
-// advertising/browsing immediately on launch.
+// App entry point. Shows a main dashboard window for monitoring sync status,
+// peers, and activity. Also provides a menu bar icon for quick access.
+// Owns the NetworkManager and starts advertising/browsing on launch.
 
 import SwiftUI
 
@@ -14,13 +14,19 @@ struct ClaudeSyncApp: App {
     @StateObject private var networkManager = NetworkManager()
 
     var body: some Scene {
+        // Main dashboard window — the primary UI.
+        WindowGroup("Claude Sync") {
+            DashboardView()
+                .environmentObject(networkManager)
+        }
+        .defaultSize(width: 720, height: 500)
+
+        // Menu bar icon for quick status when the window is closed.
         MenuBarExtra {
             MenuBarView()
                 .environmentObject(networkManager)
-                .frame(width: 360, minHeight: 300, maxHeight: 600)
+                .frame(minWidth: 360, maxWidth: 360, minHeight: 300, maxHeight: 600)
         } label: {
-            // The menu bar icon indicates sync capability.
-            // Uses a system symbol that communicates bidirectional sync.
             Label("Claude Sync", systemImage: "arrow.triangle.2.circlepath")
         }
         .menuBarExtraStyle(.window)

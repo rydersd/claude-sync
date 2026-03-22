@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.claudesync.app",
   "build": {
-    "frontendDist": "../"
+    "beforeDevCommand": "npm run dev:vite",
+    "beforeBuildCommand": "npm run build:vite",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
   "app": {
     "windows": [
@@ -24,6 +27,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": ["icons/icon.png"]
   }
 }

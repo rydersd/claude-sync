@@ -31,6 +31,8 @@ export interface FileEntry {
   size: number;
   /** Whether the file has the executable bit set */
   executable: boolean;
+  /** Last modification time as Unix epoch seconds (UTC) */
+  mtime_epoch: number;
 }
 
 /** Single file difference between local and remote */
@@ -95,4 +97,82 @@ export interface ConfigTree {
   fingerprint: string;
   /** Total number of files */
   file_count: number;
+}
+
+// -- v2: Auto-sync types ---------------------------------------------------
+
+/** Status of the real-time auto-sync feature */
+export interface AutoSyncStatus {
+  /** Whether auto-sync mode is enabled */
+  enabled: boolean;
+  /** Whether the file watcher is currently active */
+  watching: boolean;
+  /** List of device_ids with active persistent connections */
+  connected_peers: string[];
+  /** Epoch ms of last detected file change, or null if none */
+  last_change_detected: number | null;
+}
+
+/** A single file change detected by the file watcher */
+export interface FileChange {
+  /** Relative path within ~/.claude/ */
+  path: string;
+  /** Type of change */
+  change: 'modified' | 'created' | 'deleted';
+  /** When the change was detected (epoch ms) */
+  timestamp_ms: number;
+}
+
+// -- v2: WAN / Tracker types ------------------------------------------------
+
+/** A peer discovered via the tracker server (WAN) */
+export interface TrackerPeer {
+  /** Unique device identifier */
+  device_id: string;
+  /** Human-readable device name */
+  name: string;
+  /** OS platform: "macos", "linux", "windows" */
+  platform: string;
+  /** Public address as seen by the tracker */
+  public_addr: string;
+  /** Certificate fingerprint (SHA-256, colon-separated hex) */
+  fingerprint: string;
+  /** Number of config files on the peer */
+  file_count: number;
+  /** Protocol capabilities advertised by the peer */
+  capabilities: string[];
+  /** Unix epoch seconds of last tracker heartbeat */
+  last_seen: number;
+}
+
+/** Sync configuration persisted at ~/.claude/sync-config.json */
+export interface SyncConfig {
+  /** List of tracker servers for WAN discovery */
+  trackers: TrackerConfig[];
+  /** Auto-sync behavior settings */
+  auto_sync: { enabled: boolean; debounce_ms: number };
+  /** Security and pairing settings */
+  security: { require_pairing: boolean; allow_unpaired_lan: boolean };
+}
+
+/** Configuration for a single tracker server */
+export interface TrackerConfig {
+  /** WebSocket URL (e.g., "wss://tracker.example.com/ws") */
+  url: string;
+  /** Human-readable name for display */
+  name: string;
+  /** Whether this tracker is currently enabled */
+  enabled: boolean;
+}
+
+/** A paired device for WAN trust */
+export interface PairedDevice {
+  /** Unique device identifier */
+  device_id: string;
+  /** Human-readable device name */
+  name: string;
+  /** Certificate fingerprint (SHA-256, colon-separated hex) */
+  cert_fingerprint: string;
+  /** Unix epoch seconds when pairing was established */
+  paired_at: number;
 }

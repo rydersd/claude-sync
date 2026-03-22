@@ -195,9 +195,10 @@ final class ServiceBrowser: @unchecked Sendable {
             return nil
         }
 
-        // Extract fields from TXT record. device_id is required.
-        guard let deviceId = txt["device_id"] else {
-            logger.debug("TXT record missing device_id for service: \(name)")
+        // Extract fields from TXT record per PROTOCOL.md Section 2.2.
+        // The `id` field is required.
+        guard let deviceId = txt["id"] else {
+            logger.debug("TXT record missing id for service: \(name)")
             return nil
         }
 
@@ -206,7 +207,8 @@ final class ServiceBrowser: @unchecked Sendable {
         let configCountStr = txt["configs"] ?? "0"
         let configCount = Int(configCountStr) ?? 0
         let fingerprint = txt["fingerprint"] ?? ""
-        let version = txt["version"] ?? "1"
+        let versionStr = txt["v"] ?? "1"
+        let version = Int(versionStr) ?? 1
 
         return PeerInfo(
             deviceId: deviceId,
@@ -244,7 +246,7 @@ struct PeerInfo: Sendable {
     let platform: String
     let configCount: Int
     let fingerprint: String
-    let protocolVersion: String
+    let protocolVersion: Int
     let endpoint: NWEndpoint?
     let browserResult: NWBrowser.Result?
     let serviceName: String

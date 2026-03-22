@@ -49,6 +49,11 @@ class ClaudeSyncProtocol: NWProtocolFramerImplementation {
         // Nothing to do.
     }
 
+    /// Called when the framer is being cleaned up.
+    func cleanup(framer: NWProtocolFramer.Instance) {
+        // No cleanup needed.
+    }
+
     /// Handles outgoing messages. Prepends the 4-byte length header
     /// to the message data before passing it to the wire.
     func handleOutput(

@@ -2,16 +2,18 @@
 // Sync engine - orchestrates push and pull operations with a remote peer.
 // Connects to the peer via TCP, exchanges manifests, computes diffs,
 // and transfers files based on the selected direction.
+// Message types and wire format per PROTOCOL.md.
 // ==========================================================================
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::config_scanner;
-use crate::connection::{ConnectionError, FramedConnection};
+use crate::conflict_resolver::{self, ConflictResolution};
+use crate::connection::FramedConnection;
 use crate::device_identity;
 use crate::diff_engine;
 use crate::protocol::{
@@ -38,9 +40,10 @@ pub async fn push_to_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
         device_id: device_identity::get_or_create_device_id(),
         name: device_identity::get_hostname(),
         protocol_version: PROTOCOL_VERSION,
-        fingerprint,
+        fingerprint: fingerprint.clone(),
         platform: device_identity::get_platform(),
         file_count: local_files.len() as u32,
+        capabilities: Some(vec!["file_watch".to_string(), "keepalive".to_string()]),
     };
 
     conn.send(&hello)
@@ -54,12 +57,28 @@ pub async fn push_to_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
         .map_err(|e| format!("Failed to receive Hello: {}", e))?;
 
     match &peer_hello {
-        SyncMessage::Hello { protocol_version, .. } => {
+        SyncMessage::Hello { protocol_version, fingerprint: peer_fp, .. } => {
             if *protocol_version != PROTOCOL_VERSION {
                 return Err(format!(
                     "Protocol version mismatch: local={}, remote={}",
                     PROTOCOL_VERSION, protocol_version
                 ));
+            }
+            // Quick sync check: if fingerprints match, no sync needed
+            if *peer_fp == fingerprint {
+                conn.send(&SyncMessage::SyncNotNeeded {
+                    fingerprint: fingerprint.clone(),
+                })
+                .await
+                .map_err(|e| format!("Failed to send SyncNotNeeded: {}", e))?;
+
+                let _ = conn.shutdown().await;
+                return Ok(SyncResult {
+                    success: true,
+                    files_transferred: 0,
+                    direction: "push".to_string(),
+                    error: None,
+                });
             }
         }
         SyncMessage::Error { code, message } => {
@@ -83,7 +102,22 @@ pub async fn push_to_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
 
     let remote_files: HashMap<String, FileEntry> = match remote_manifest {
         SyncMessage::Manifest { files } => {
-            files.into_iter().map(|f| (f.path.clone(), f)).collect()
+            // Convert ManifestFileEntry to FileEntry for diff engine
+            files
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        FileEntry {
+                            path: f.path,
+                            sha256: f.sha256,
+                            size: f.size,
+                            executable: false,
+                            mtime_epoch: f.mtime_epoch,
+                        },
+                    )
+                })
+                .collect()
         }
         SyncMessage::Error { code, message } => {
             return Err(format!("Peer error ({}): {}", code, message));
@@ -162,7 +196,7 @@ pub async fn push_to_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
             let entry = &local_files[path];
             let content_base64 = BASE64.encode(&content);
 
-            conn.send(&SyncMessage::FileTransfer {
+            conn.send(&SyncMessage::File {
                 path: path.clone(),
                 content_base64,
                 sha256: entry.sha256.clone(),
@@ -235,9 +269,10 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
         device_id: device_identity::get_or_create_device_id(),
         name: device_identity::get_hostname(),
         protocol_version: PROTOCOL_VERSION,
-        fingerprint,
+        fingerprint: fingerprint.clone(),
         platform: device_identity::get_platform(),
         file_count: local_files.len() as u32,
+        capabilities: Some(vec!["file_watch".to_string(), "keepalive".to_string()]),
     };
 
     conn.send(&hello)
@@ -251,12 +286,28 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
         .map_err(|e| format!("Failed to receive Hello: {}", e))?;
 
     match &peer_hello {
-        SyncMessage::Hello { protocol_version, .. } => {
+        SyncMessage::Hello { protocol_version, fingerprint: peer_fp, .. } => {
             if *protocol_version != PROTOCOL_VERSION {
                 return Err(format!(
                     "Protocol version mismatch: local={}, remote={}",
                     PROTOCOL_VERSION, protocol_version
                 ));
+            }
+            // Quick sync check: if fingerprints match, no sync needed
+            if *peer_fp == fingerprint {
+                conn.send(&SyncMessage::SyncNotNeeded {
+                    fingerprint: fingerprint.clone(),
+                })
+                .await
+                .map_err(|e| format!("Failed to send SyncNotNeeded: {}", e))?;
+
+                let _ = conn.shutdown().await;
+                return Ok(SyncResult {
+                    success: true,
+                    files_transferred: 0,
+                    direction: "pull".to_string(),
+                    error: None,
+                });
             }
         }
         SyncMessage::Error { code, message } => {
@@ -280,7 +331,22 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
 
     let remote_files: HashMap<String, FileEntry> = match remote_manifest {
         SyncMessage::Manifest { files } => {
-            files.into_iter().map(|f| (f.path.clone(), f)).collect()
+            // Convert ManifestFileEntry to FileEntry for diff engine
+            files
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        FileEntry {
+                            path: f.path,
+                            sha256: f.sha256,
+                            size: f.size,
+                            executable: false,
+                            mtime_epoch: f.mtime_epoch,
+                        },
+                    )
+                })
+                .collect()
         }
         SyncMessage::Error { code, message } => {
             return Err(format!("Peer error ({}): {}", code, message));
@@ -359,11 +425,11 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
             .map_err(|e| format!("Failed to receive file: {}", e))?;
 
         match msg {
-            SyncMessage::FileTransfer {
+            SyncMessage::File {
                 path,
                 content_base64,
                 sha256,
-                size: _,
+                size,
                 executable,
             } => {
                 // Decode the file content
@@ -371,7 +437,25 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
                     .decode(&content_base64)
                     .map_err(|e| format!("Failed to decode base64 for {}: {}", path, e))?;
 
-                // Verify hash
+                // Verify size per PROTOCOL.md Section 4.3
+                if content.len() as u64 != size {
+                    log::warn!(
+                        "Size mismatch for {}: expected {}, got {}",
+                        path,
+                        size,
+                        content.len()
+                    );
+                    conn.send(&SyncMessage::FileAck {
+                        path: path.clone(),
+                        success: false,
+                        error: Some("size_mismatch".to_string()),
+                    })
+                    .await
+                    .map_err(|e| format!("Failed to send FileAck: {}", e))?;
+                    continue;
+                }
+
+                // Verify hash per PROTOCOL.md Section 4.3
                 let actual_hash = compute_sha256(&content);
                 if actual_hash != sha256 {
                     log::warn!(
@@ -383,20 +467,29 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
                     conn.send(&SyncMessage::FileAck {
                         path: path.clone(),
                         success: false,
-                        error: Some("Hash mismatch".to_string()),
+                        error: Some("checksum_mismatch".to_string()),
                     })
                     .await
                     .map_err(|e| format!("Failed to send FileAck: {}", e))?;
                     continue;
                 }
 
-                // Write the file
+                // Atomic write per PROTOCOL.md Section 5.6:
+                // Write to temp file, then rename to final path.
                 let file_path = claude_home.join(&path);
                 if let Some(parent) = file_path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
 
-                match fs::write(&file_path, &content) {
+                // Write to temp file in the same directory
+                let tmp_path = file_path.with_extension(format!(
+                    "tmp.{}",
+                    std::process::id()
+                ));
+                let write_result = fs::write(&tmp_path, &content)
+                    .and_then(|_| fs::rename(&tmp_path, &file_path));
+
+                match write_result {
                     Ok(_) => {
                         // Set executable permission if needed (Unix only)
                         #[cfg(unix)]
@@ -418,6 +511,8 @@ pub async fn pull_from_peer(peer: &PeerInfo) -> Result<SyncResult, String> {
                         .map_err(|e| format!("Failed to send FileAck: {}", e))?;
                     }
                     Err(e) => {
+                        // Clean up temp file if rename failed
+                        let _ = fs::remove_file(&tmp_path);
                         conn.send(&SyncMessage::FileAck {
                             path,
                             success: false,
@@ -478,6 +573,7 @@ pub async fn compute_peer_diff(peer: &PeerInfo) -> Result<DiffResult, String> {
         fingerprint,
         platform: device_identity::get_platform(),
         file_count: local_files.len() as u32,
+        capabilities: Some(vec!["file_watch".to_string(), "keepalive".to_string()]),
     })
     .await
     .map_err(|e| format!("Failed to send Hello: {}", e))?;
@@ -501,7 +597,22 @@ pub async fn compute_peer_diff(peer: &PeerInfo) -> Result<DiffResult, String> {
 
     let remote_files: HashMap<String, FileEntry> = match remote_manifest {
         SyncMessage::Manifest { files } => {
-            files.into_iter().map(|f| (f.path.clone(), f)).collect()
+            // Convert ManifestFileEntry to FileEntry for diff engine
+            files
+                .into_iter()
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        FileEntry {
+                            path: f.path,
+                            sha256: f.sha256,
+                            size: f.size,
+                            executable: false,
+                            mtime_epoch: f.mtime_epoch,
+                        },
+                    )
+                })
+                .collect()
         }
         _ => {
             return Err("Expected Manifest response from peer".to_string());
@@ -521,4 +632,242 @@ fn compute_sha256(data: &[u8]) -> String {
     hasher.update(data);
     let result = hasher.finalize();
     result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+// ==========================================================================
+// v2: Real-time file change handling
+// ==========================================================================
+
+/// Create a FileChanged message for a local file that was modified.
+/// Reads the file, computes its hash, and optionally includes the content.
+///
+/// `previous_sha256` is the hash we last knew the file had (from config_scanner
+/// state before the change). This lets the receiver detect conflicts.
+pub fn create_file_changed_message(
+    path: &str,
+    change: &str,
+    previous_sha256: Option<String>,
+) -> Result<SyncMessage, String> {
+    let claude_home = config_scanner::claude_home_dir();
+    let file_path = claude_home.join(path);
+
+    match change {
+        "deleted" => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            Ok(SyncMessage::FileChanged {
+                path: path.to_string(),
+                change: "deleted".to_string(),
+                sha256: None,
+                size: None,
+                mtime_epoch: now_ms / 1000,
+                change_epoch_ms: now_ms,
+                previous_sha256,
+                content_base64: None,
+                executable: None,
+            })
+        }
+        "modified" | "created" => {
+            let content = fs::read(&file_path)
+                .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+
+            let sha256 = compute_sha256(&content);
+            let size = content.len() as u64;
+
+            let mtime_epoch = fs::metadata(&file_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+
+            let content_base64 = BASE64.encode(&content);
+
+            // Check executable bit (Unix)
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                fs::metadata(&file_path)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+
+            Ok(SyncMessage::FileChanged {
+                path: path.to_string(),
+                change: change.to_string(),
+                sha256: Some(sha256),
+                size: Some(size),
+                mtime_epoch,
+                change_epoch_ms: now_ms,
+                previous_sha256,
+                content_base64: Some(content_base64),
+                executable: Some(executable),
+            })
+        }
+        _ => Err(format!("Unknown change type: {}", change)),
+    }
+}
+
+/// Handle an incoming FileChanged message from a remote peer.
+/// Checks for conflicts using the previous_sha256 field, resolves them
+/// using the conflict resolver, and writes the file atomically.
+///
+/// Returns a FileChangedAck message indicating whether the change was accepted.
+pub fn handle_incoming_file_changed(
+    msg: &SyncMessage,
+    remote_device_id: &str,
+) -> Result<SyncMessage, String> {
+    let (path, change, sha256, size, _mtime_epoch, change_epoch_ms, previous_sha256, content_base64, executable) =
+        match msg {
+            SyncMessage::FileChanged {
+                path,
+                change,
+                sha256,
+                size,
+                mtime_epoch,
+                change_epoch_ms,
+                previous_sha256,
+                content_base64,
+                executable,
+            } => (
+                path, change, sha256, size, mtime_epoch, change_epoch_ms,
+                previous_sha256, content_base64, executable,
+            ),
+            _ => return Err("Expected FileChanged message".to_string()),
+        };
+
+    let claude_home = config_scanner::claude_home_dir();
+    let file_path = claude_home.join(path);
+    let local_device_id = device_identity::get_or_create_device_id();
+
+    // Handle deletion
+    if change == "deleted" {
+        if file_path.exists() {
+            fs::remove_file(&file_path)
+                .map_err(|e| format!("Failed to delete {}: {}", path, e))?;
+            log::info!("Deleted file via file_changed: {}", path);
+        }
+        return Ok(SyncMessage::FileChangedAck {
+            path: path.clone(),
+            accepted: true,
+            conflict: false,
+        });
+    }
+
+    // For create/modify, we need the content
+    let content_b64 = content_base64.as_ref().ok_or_else(|| {
+        format!("FileChanged for '{}' is missing content_base64", path)
+    })?;
+    let remote_content = BASE64.decode(content_b64)
+        .map_err(|e| format!("Failed to decode base64 for {}: {}", path, e))?;
+
+    // Verify size if provided
+    if let Some(expected_size) = size {
+        if remote_content.len() as u64 != *expected_size {
+            return Ok(SyncMessage::FileChangedAck {
+                path: path.clone(),
+                accepted: false,
+                conflict: false,
+            });
+        }
+    }
+
+    // Verify hash if provided
+    if let Some(expected_hash) = sha256 {
+        let actual_hash = compute_sha256(&remote_content);
+        if actual_hash != *expected_hash {
+            return Ok(SyncMessage::FileChangedAck {
+                path: path.clone(),
+                accepted: false,
+                conflict: false,
+            });
+        }
+    }
+
+    // Check for conflict: does the local file's current hash match the expected previous_sha256?
+    let mut conflict_detected = false;
+    let final_content = if file_path.exists() {
+        let local_content = fs::read(&file_path)
+            .map_err(|e| format!("Failed to read local {}: {}", path, e))?;
+        let local_hash = compute_sha256(&local_content);
+
+        if let Some(prev_hash) = previous_sha256 {
+            if local_hash != *prev_hash {
+                // Conflict: local file has changed since the remote last saw it
+                conflict_detected = true;
+
+                let local_mtime_ms = fs::metadata(&file_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                match conflict_resolver::resolve_conflict(
+                    path,
+                    &local_content,
+                    &remote_content,
+                    local_mtime_ms,
+                    *change_epoch_ms,
+                    &local_device_id,
+                    remote_device_id,
+                ) {
+                    ConflictResolution::AcceptRemote(data) => data,
+                    ConflictResolution::KeepLocal => {
+                        return Ok(SyncMessage::FileChangedAck {
+                            path: path.clone(),
+                            accepted: false,
+                            conflict: true,
+                        });
+                    }
+                    ConflictResolution::Merge(data) => data,
+                }
+            } else {
+                // No conflict: local matches expected previous state
+                remote_content
+            }
+        } else {
+            // No previous_sha256 provided; accept remote unconditionally
+            remote_content
+        }
+    } else {
+        // File doesn't exist locally; just accept the remote content
+        remote_content
+    };
+
+    // Atomic write: temp file + rename (per PROTOCOL.md Section 5.6)
+    if let Some(parent) = file_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let tmp_path = file_path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp_path, &final_content)
+        .and_then(|_| fs::rename(&tmp_path, &file_path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            format!("Failed to write {}: {}", path, e)
+        })?;
+
+    // Set executable permission if requested (Unix only)
+    #[cfg(unix)]
+    if let Some(true) = executable {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755));
+    }
+
+    log::info!(
+        "Applied file_changed for '{}' (change={}, conflict={})",
+        path,
+        change,
+        conflict_detected
+    );
+
+    Ok(SyncMessage::FileChangedAck {
+        path: path.clone(),
+        accepted: true,
+        conflict: conflict_detected,
+    })
 }

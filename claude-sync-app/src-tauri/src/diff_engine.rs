@@ -32,7 +32,7 @@ pub fn compare_trees(
     let mut added_paths: Vec<&&String> = remote_paths.difference(&local_paths).collect();
     added_paths.sort();
     for path in added_paths {
-        let remote_entry = &remote_files[**path];
+        let remote_entry = &remote_files[*path];
         added.push(FileDiff {
             path: (**path).clone(),
             change_type: "added".to_string(),
@@ -47,8 +47,8 @@ pub fn compare_trees(
     let mut common_paths: Vec<&&String> = local_paths.intersection(&remote_paths).collect();
     common_paths.sort();
     for path in common_paths {
-        let local_entry = &local_files[**path];
-        let remote_entry = &remote_files[**path];
+        let local_entry = &local_files[*path];
+        let remote_entry = &remote_files[*path];
 
         if local_entry.sha256 != remote_entry.sha256 {
             modified.push(FileDiff {
@@ -66,7 +66,7 @@ pub fn compare_trees(
     let mut deleted_paths: Vec<&&String> = local_paths.difference(&remote_paths).collect();
     deleted_paths.sort();
     for path in deleted_paths {
-        let local_entry = &local_files[**path];
+        let local_entry = &local_files[*path];
         deleted.push(FileDiff {
             path: (**path).clone(),
             change_type: "deleted".to_string(),
@@ -99,6 +99,7 @@ mod tests {
                 sha256: hash.to_string(),
                 size,
                 executable: false,
+                mtime_epoch: 0,
             },
         )
     }
@@ -113,12 +114,14 @@ mod tests {
             sha256: "abc123".to_string(),
             size: 100,
             executable: false,
+            mtime_epoch: 0,
         });
         remote.insert("CLAUDE.md".to_string(), FileEntry {
             path: "CLAUDE.md".to_string(),
             sha256: "abc123".to_string(),
             size: 100,
             executable: false,
+            mtime_epoch: 0,
         });
 
         let diff = compare_trees(&local, &remote);

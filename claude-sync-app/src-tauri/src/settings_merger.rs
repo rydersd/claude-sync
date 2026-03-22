@@ -1,16 +1,22 @@
 // ==========================================================================
 // Settings merger - handles portable vs machine-specific settings.json keys
 // When syncing settings.json, only portable keys are transferred.
-// Machine-specific keys (env, permissions) stay local.
+// Machine-specific keys (env, mcpServers, projects) stay local.
 // ==========================================================================
 
 use serde_json::{Map, Value};
 
 /// Keys in settings.json that are portable (safe to sync between machines).
-const PORTABLE_KEYS: &[&str] = &["hooks", "statusLine", "attribution"];
+/// Must match the macOS app's SettingsMerger.portableKeys.
+const PORTABLE_KEYS: &[&str] = &["hooks", "statusLine", "attribution", "permissions", "theme", "teammateMode"];
 
 /// Keys in settings.json that are machine-specific (never synced).
-const MACHINE_SPECIFIC_KEYS: &[&str] = &["env", "permissions"];
+const MACHINE_SPECIFIC_KEYS: &[&str] = &["env", "mcpServers", "projects"];
+
+/// Specific env var keys promoted to sync between machines.
+/// The env block as a whole remains machine-specific — only these named keys transfer.
+/// [EXPERIMENTAL -> STANDARD]
+const RECOMMENDED_ENV_KEYS: &[&str] = &["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"];
 
 /// Extract only the portable keys from a settings.json value.
 /// Returns a new JSON object containing only the keys safe to sync.
@@ -21,6 +27,18 @@ pub fn extract_portable(settings: &Value) -> Value {
             for key in PORTABLE_KEYS {
                 if let Some(value) = map.get(*key) {
                     portable.insert(key.to_string(), value.clone());
+                }
+            }
+            // Extract recommended env keys (specific keys promoted from env block)
+            if let Some(Value::Object(env_map)) = map.get("env") {
+                let mut rec_env = Map::new();
+                for key in RECOMMENDED_ENV_KEYS {
+                    if let Some(value) = env_map.get(*key) {
+                        rec_env.insert(key.to_string(), value.clone());
+                    }
+                }
+                if !rec_env.is_empty() {
+                    portable.insert("env".to_string(), Value::Object(rec_env));
                 }
             }
             Value::Object(portable)
@@ -58,8 +76,28 @@ pub fn merge_for_push(home_settings: &Value) -> Value {
 /// Prepare settings for pull: merge remote portable keys into local settings.
 /// Machine-specific keys in local_settings are preserved.
 pub fn merge_for_pull(local_settings: &Value, repo_settings: &Value) -> Value {
-    let portable = extract_portable(repo_settings);
-    deep_merge(local_settings, &portable)
+    let mut portable = extract_portable(repo_settings);
+    // Pop env from portable before deep merge — env needs surgical key-level merge,
+    // not wholesale replacement (which would clobber local-only env vars).
+    let remote_rec_env = portable.as_object_mut()
+        .and_then(|m| m.remove("env"));
+    let mut result = deep_merge(local_settings, &portable);
+    // Merge only recommended env keys into local env without clobbering
+    if let Some(Value::Object(rec_env)) = remote_rec_env {
+        if let Some(result_obj) = result.as_object_mut() {
+            let local_env = result_obj
+                .entry("env")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(local_env_map) = local_env {
+                for key in RECOMMENDED_ENV_KEYS {
+                    if let Some(value) = rec_env.get(*key) {
+                        local_env_map.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Check if a settings object contains any machine-specific keys
@@ -89,7 +127,9 @@ mod tests {
             "hooks": {"PreToolUse": []},
             "env": {"PATH": "/usr/bin"},
             "permissions": {"allow": ["*"]},
-            "statusLine": "custom"
+            "statusLine": "custom",
+            "theme": "dark",
+            "mcpServers": {"server1": {}}
         });
 
         let portable = extract_portable(&settings);
@@ -97,8 +137,10 @@ mod tests {
 
         assert!(map.contains_key("hooks"));
         assert!(map.contains_key("statusLine"));
+        assert!(map.contains_key("permissions"));
+        assert!(map.contains_key("theme"));
         assert!(!map.contains_key("env"));
-        assert!(!map.contains_key("permissions"));
+        assert!(!map.contains_key("mcpServers"));
     }
 
     #[test]
@@ -165,8 +207,10 @@ mod tests {
     #[test]
     fn test_has_machine_specific_keys() {
         assert!(has_machine_specific_keys(&json!({"env": {}})));
-        assert!(has_machine_specific_keys(&json!({"permissions": {}})));
+        assert!(has_machine_specific_keys(&json!({"mcpServers": {}})));
+        assert!(has_machine_specific_keys(&json!({"projects": {}})));
         assert!(!has_machine_specific_keys(&json!({"hooks": {}})));
+        assert!(!has_machine_specific_keys(&json!({"permissions": {}})));
         assert!(!has_machine_specific_keys(&json!({})));
     }
 }

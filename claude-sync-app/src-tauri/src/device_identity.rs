@@ -1,18 +1,18 @@
 // ==========================================================================
 // Device identity management
 // Generates and persists a stable UUID v4 for this device.
-// The UUID is stored in ~/.claude-sync-device-id so it survives app reinstalls.
+// Storage path per PROTOCOL.md Section 2.4:
+//   macOS:   ~/Library/Application Support/claude-sync/device-id
+//   Windows: %APPDATA%\claude-sync\device-id
+//   Linux:   ~/.local/share/claude-sync/device-id (XDG data dir)
 // ==========================================================================
 
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// Filename for the persisted device identity.
-const DEVICE_ID_FILE: &str = ".claude-sync-device-id";
-
 /// Get or create a stable device identity UUID.
-/// The ID is persisted to a file in the user's home directory so it
+/// The ID is persisted to a platform-appropriate path so it
 /// remains consistent across app restarts and updates.
 pub fn get_or_create_device_id() -> String {
     let id_path = device_id_path();
@@ -59,11 +59,20 @@ pub fn get_platform() -> String {
     }
 }
 
-/// Path to the device ID file: ~/.claude-sync-device-id
+/// Path to the device ID file per PROTOCOL.md Section 2.4.
+/// Uses the platform-appropriate application data directory.
 fn device_id_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(DEVICE_ID_FILE)
+    // dirs::data_dir() returns:
+    //   macOS:   ~/Library/Application Support
+    //   Windows: %APPDATA% (C:\Users\<user>\AppData\Roaming)
+    //   Linux:   ~/.local/share (XDG_DATA_HOME)
+    let base = dirs::data_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+
+    base.join("claude-sync").join("device-id")
 }
 
 #[cfg(test)]
@@ -84,5 +93,23 @@ mod tests {
     fn test_get_hostname_returns_nonempty() {
         let host = get_hostname();
         assert!(!host.is_empty(), "Hostname should not be empty");
+    }
+
+    #[test]
+    fn test_device_id_path_uses_app_support() {
+        let path = device_id_path();
+        let path_str = path.to_string_lossy();
+        // Should contain claude-sync directory name
+        assert!(
+            path_str.contains("claude-sync"),
+            "Device ID path should be under claude-sync dir: {}",
+            path_str
+        );
+        // Should NOT be in home root like old .claude-sync-device-id
+        assert!(
+            !path_str.ends_with(".claude-sync-device-id"),
+            "Device ID should not use old flat-file path: {}",
+            path_str
+        );
     }
 }

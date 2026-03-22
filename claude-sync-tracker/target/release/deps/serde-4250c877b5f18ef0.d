@@ -1,0 +1,14 @@
+/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/deps/serde-4250c877b5f18ef0.d: /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/build/serde-bfb53c9a55e83b79/out/private.rs
+
+/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/deps/libserde-4250c877b5f18ef0.rlib: /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/build/serde-bfb53c9a55e83b79/out/private.rs
+
+/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/deps/libserde-4250c877b5f18ef0.rmeta: /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/build/serde-bfb53c9a55e83b79/out/private.rs
+
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/ryders/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/build/serde-bfb53c9a55e83b79/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/ryders/Developer/GitHub/claudeTools/claude-sync-tracker/target/release/build/serde-bfb53c9a55e83b79/out

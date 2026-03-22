@@ -27,7 +27,7 @@ final class Peer: Identifiable, Hashable {
     var fingerprint: String
 
     /// Protocol version for compatibility checking.
-    var protocolVersion: String
+    var protocolVersion: Int
 
     /// Current connection status to this peer.
     var status: SyncStatus
@@ -50,17 +50,27 @@ final class Peer: Identifiable, Hashable {
     /// Number of files that differ between local and this peer.
     var differingFileCount: Int
 
+    /// Whether this peer has an active auto-sync subscription (persistent connection).
+    var isAutoSyncSubscribed: Bool
+
+    /// Timestamp of the last auto-sync event for this peer, if any.
+    var lastAutoSyncDate: Date?
+
+    /// The connection type for this peer: .lan (Bonjour), .wan (tracker relay), or .relay.
+    var connectionType: PeerConnectionType
+
     init(
         id: String,
         name: String,
         platform: String = "unknown",
         configCount: Int = 0,
         fingerprint: String = "",
-        protocolVersion: String = "1",
+        protocolVersion: Int = 1,
         status: SyncStatus = .discovered,
         endpoint: NWEndpoint? = nil,
         browserResult: NWBrowser.Result? = nil,
-        lastSeen: Date = Date()
+        lastSeen: Date = Date(),
+        connectionType: PeerConnectionType = .lan
     ) {
         self.id = id
         self.name = name
@@ -74,6 +84,9 @@ final class Peer: Identifiable, Hashable {
         self.lastSeen = lastSeen
         self.remoteManifest = nil
         self.differingFileCount = 0
+        self.isAutoSyncSubscribed = false
+        self.lastAutoSyncDate = nil
+        self.connectionType = connectionType
     }
 
     // MARK: - Hashable
@@ -102,6 +115,41 @@ final class Peer: Identifiable, Hashable {
         }
     }
 
+    /// SF Symbol name for the connection type (LAN vs WAN vs Relay).
+    var connectionTypeIcon: String {
+        switch connectionType {
+        case .lan:
+            return "wifi"
+        case .wan:
+            return "globe"
+        case .relay:
+            return "arrow.triangle.swap"
+        }
+    }
+
+    /// Human-readable label for the connection type.
+    var connectionTypeLabel: String {
+        connectionType.rawValue.uppercased()
+    }
+
+    /// Human-readable description of the last auto-sync event.
+    var lastAutoSyncDescription: String? {
+        guard let date = lastAutoSyncDate else { return nil }
+        let interval = Date().timeIntervalSince(date)
+        if interval < 60 {
+            return "Just now"
+        } else if interval < 3600 {
+            let minutes = Int(interval / 60)
+            return "\(minutes)m ago"
+        } else if interval < 86400 {
+            let hours = Int(interval / 3600)
+            return "\(hours)h ago"
+        } else {
+            let days = Int(interval / 86400)
+            return "\(days)d ago"
+        }
+    }
+
     /// Human-readable description of when this peer was last seen.
     var lastSeenDescription: String {
         let interval = Date().timeIntervalSince(lastSeen)
@@ -118,4 +166,16 @@ final class Peer: Identifiable, Hashable {
             return "\(days) day\(days == 1 ? "" : "s") ago"
         }
     }
+}
+
+// MARK: - Connection Type
+
+/// How we are connected to a peer — LAN (Bonjour), WAN (tracker-mediated), or Relay.
+enum PeerConnectionType: String, Sendable {
+    /// Discovered and connected via local network Bonjour/mDNS.
+    case lan
+    /// Discovered via a remote tracker server (direct WAN connection).
+    case wan
+    /// Connected via a relay server (NAT traversal fallback).
+    case relay
 }

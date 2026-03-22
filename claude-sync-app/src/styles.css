@@ -489,9 +489,40 @@ footer {
   flex-shrink: 0;
 }
 
+.footer-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
 .footer-text {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+.btn-folder {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-folder:hover {
+  background-color: var(--bg-hover);
+  border-color: var(--accent-blue);
+  color: var(--text-primary);
+}
+
+.folder-icon {
+  font-size: 13px;
 }
 
 /* -- Highlight ----------------------------------------------------------- */
@@ -517,4 +548,666 @@ footer {
 
 ::-webkit-scrollbar-thumb:hover {
   background-color: var(--text-muted);
+}
+
+/* ==========================================================================
+   Auto-Sync Panel
+   ========================================================================== */
+
+.auto-sync-panel {
+  /* Uses the standard .panel class from the parent */
+}
+
+.auto-sync-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.btn-toggle-sync {
+  padding: 8px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  background-color: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  transition: all var(--transition-fast);
+}
+
+.btn-toggle-sync:hover {
+  background-color: var(--bg-hover);
+  border-color: var(--accent-green);
+  color: var(--text-primary);
+}
+
+.btn-toggle-sync.active {
+  background-color: rgba(74, 222, 128, 0.1);
+  border-color: rgba(74, 222, 128, 0.3);
+  color: var(--accent-green);
+}
+
+.btn-toggle-sync:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.auto-sync-details {
+  padding: 8px 0;
+}
+
+/* -- Watching Indicator --------------------------------------------------- */
+
+.watching-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.watching-indicator .status-dot {
+  background: var(--text-muted);
+}
+
+.watching-indicator.active .status-dot {
+  background: var(--accent-green);
+  box-shadow: 0 0 6px var(--accent-green);
+  animation: pulse 2s infinite;
+}
+
+/* -- Connection Type Badges ----------------------------------------------- */
+
+.peer-item .connection-type {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.connection-type.lan {
+  background-color: rgba(74, 158, 255, 0.15);
+  color: var(--accent-blue);
+}
+
+.connection-type.wan {
+  background-color: rgba(167, 139, 250, 0.15);
+  color: var(--accent-purple);
+}
+
+.connection-type.relay {
+  background-color: rgba(250, 204, 21, 0.15);
+  color: var(--accent-yellow);
+}
+
+/* -- Auto-sync indicator on peers ----------------------------------------- */
+
+.peer-auto-sync-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-green);
+  display: inline-block;
+  margin-left: 4px;
+  animation: pulse 2s infinite;
+}
+
+.peer-last-sync {
+  font-size: 10px;
+  color: rgba(74, 222, 128, 0.8);
+  margin-left: 4px;
+}
+
+/* ==========================================================================
+   Settings Panel
+   ========================================================================== */
+
+.settings-panel {
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  padding: 12px 16px;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 12px;
+}
+
+.settings-tabs .tab {
+  padding: 8px 16px;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  transition: all var(--transition-fast);
+}
+
+.settings-tabs .tab:hover {
+  color: var(--text-primary);
+}
+
+.settings-tabs .tab.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 8px;
+}
+
+/* -- Setting Rows --------------------------------------------------------- */
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(42, 53, 80, 0.5);
+}
+
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.setting-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.setting-description {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.setting-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-value {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  min-width: 50px;
+  text-align: right;
+}
+
+/* -- Toggle Switch -------------------------------------------------------- */
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 20px;
+  transition: all var(--transition-fast);
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 2px;
+  bottom: 2px;
+  background-color: var(--text-muted);
+  border-radius: 50%;
+  transition: all var(--transition-fast);
+}
+
+.toggle-switch input:checked + .toggle-slider {
+  background-color: rgba(74, 158, 255, 0.2);
+  border-color: var(--accent-blue);
+}
+
+.toggle-switch input:checked + .toggle-slider:before {
+  transform: translateX(16px);
+  background-color: var(--accent-blue);
+}
+
+.toggle-small {
+  width: 28px;
+  height: 16px;
+}
+
+.toggle-small .toggle-slider:before {
+  height: 10px;
+  width: 10px;
+  left: 2px;
+  bottom: 2px;
+}
+
+.toggle-small input:checked + .toggle-slider:before {
+  transform: translateX(12px);
+}
+
+/* -- Range Slider --------------------------------------------------------- */
+
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 140px;
+  height: 4px;
+  background: var(--bg-input);
+  border-radius: 2px;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent-blue);
+  cursor: pointer;
+  border: none;
+}
+
+/* -- Tracker List --------------------------------------------------------- */
+
+.tracker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tracker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.tracker-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tracker-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-red);
+  flex-shrink: 0;
+}
+
+.tracker-status-dot.active {
+  background: var(--accent-green);
+  box-shadow: 0 0 4px var(--accent-green);
+}
+
+.tracker-details {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tracker-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.tracker-url {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.tracker-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-remove-tracker {
+  font-size: 16px;
+  color: var(--accent-red);
+  opacity: 0.6;
+  transition: opacity var(--transition-fast);
+}
+
+.btn-remove-tracker:hover {
+  opacity: 1;
+}
+
+/* -- Add Tracker Form ----------------------------------------------------- */
+
+.add-tracker-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.input-field {
+  padding: 6px 10px;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: var(--font-sans);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.input-field:focus {
+  border-color: var(--accent-blue);
+}
+
+.input-field.mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.form-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+/* -- Buttons (secondary / primary) ---------------------------------------- */
+
+.btn-secondary {
+  padding: 6px 12px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-secondary:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.btn-primary {
+  padding: 6px 12px;
+  background-color: rgba(74, 158, 255, 0.15);
+  border: 1px solid rgba(74, 158, 255, 0.3);
+  border-radius: 5px;
+  color: var(--accent-blue);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-primary:hover {
+  background-color: rgba(74, 158, 255, 0.25);
+  border-color: var(--accent-blue);
+}
+
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* -- Pairing -------------------------------------------------------------- */
+
+.pairing-dialog {
+  padding: 12px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.pairing-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 12px;
+}
+
+.pairing-tab {
+  padding: 6px 12px;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-sans);
+  border-bottom: 2px solid transparent;
+  transition: all var(--transition-fast);
+}
+
+.pairing-tab.active {
+  color: var(--accent-blue);
+  border-bottom-color: var(--accent-blue);
+}
+
+.pairing-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+}
+
+.pairing-instruction {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.pairing-code {
+  font-size: 36px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 8px;
+  text-align: center;
+  padding: 20px 24px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--accent-blue);
+  user-select: all;
+}
+
+.pairing-code-input {
+  font-size: 24px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 6px;
+  text-align: center;
+  padding: 12px 16px;
+  width: 180px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.pairing-code-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.pairing-actions {
+  margin-top: 4px;
+}
+
+/* -- Paired Devices ------------------------------------------------------- */
+
+.paired-device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.paired-device {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.device-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+
+.device-info-col {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+}
+
+.device-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.device-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.btn-unpair {
+  padding: 4px 10px;
+  background-color: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 4px;
+  color: var(--accent-red);
+  font-size: 11px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-unpair:hover {
+  background-color: rgba(248, 113, 113, 0.2);
+  border-color: var(--accent-red);
+}
+
+/* -- Empty / Hint text ---------------------------------------------------- */
+
+.empty-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px 0;
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* -- Settings Gear Button ------------------------------------------------- */
+
+.btn-settings {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  transition: all var(--transition-fast);
+}
+
+.btn-settings:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-hover);
+  border-color: var(--border-color);
+}
+
+.btn-settings.active {
+  color: var(--accent-blue);
+  background-color: rgba(74, 158, 255, 0.1);
+  border-color: rgba(74, 158, 255, 0.3);
+}
+
+/* -- WAN Peer Section Header ---------------------------------------------- */
+
+.wan-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.wan-section-header .globe-icon {
+  font-size: 11px;
+  color: var(--accent-purple);
+}
+
+.wan-section-header .section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }

@@ -83,6 +83,9 @@ SYNC_PATHS = [
     "scripts/",
     "memory/",
     "worksets/",
+    "plugins/",
+    "keybindings.json",
+    ".claude-sync-capabilities.json",
 ]
 
 # Paths that NEVER sync
@@ -99,7 +102,6 @@ EXCLUDE_PATHS = [
     "state/",
     "plans/",
     "downloads/",
-    "plugins/",
     "shell-snapshots/",
     "paste-cache/",
     "file-history/",
@@ -108,6 +110,8 @@ EXCLUDE_PATHS = [
     ".workset-vault/",
     "worksets/_state.json",
     "worksets/_affinity.json",
+    "teams/",
+    "tasks/",
 ]
 
 # Exclusion patterns for tree walking
@@ -126,12 +130,20 @@ PORTABLE_SETTINGS_KEYS = [
     "hooks",
     "statusLine",
     "attribution",
+    "permissions",
+    "theme",
+    "teammateMode",
 ]
 
 # settings.json keys that are machine-specific (never sync)
 MACHINE_SPECIFIC_KEYS = [
     "env",
-    "permissions",
+]
+
+# [EXPERIMENTAL → STANDARD] Specific env keys synced between machines.
+# The env block as a whole remains machine-specific — only these named keys transfer.
+RECOMMENDED_ENV_KEYS = [
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
 ]
 
 
@@ -969,6 +981,16 @@ class SettingsMerger:
         for key in PORTABLE_SETTINGS_KEYS:
             if key in settings:
                 portable[key] = copy.deepcopy(settings[key])
+        # Extract recommended env keys (specific keys promoted from env block).
+        # The full env block stays machine-specific; only named keys transfer.
+        env = settings.get("env", {})
+        if isinstance(env, dict):
+            rec_env = {}
+            for env_key in RECOMMENDED_ENV_KEYS:
+                if env_key in env:
+                    rec_env[env_key] = copy.deepcopy(env[env_key])
+            if rec_env:
+                portable["env"] = rec_env
         return portable
 
     @staticmethod
@@ -993,7 +1015,20 @@ class SettingsMerger:
                        repo_settings: Dict[str, Any]) -> Dict[str, Any]:
         """Merge repo portable settings into local settings."""
         portable = cls.extract_portable(repo_settings)
-        return cls.deep_merge(local_settings, portable)
+        # Pop env from portable before deep merge — env needs surgical key-level merge,
+        # not wholesale replacement (which would clobber local-only env vars).
+        remote_rec_env = portable.pop("env", {})
+        result = cls.deep_merge(local_settings, portable)
+        # Merge only recommended env keys into local env without clobbering
+        if remote_rec_env:
+            local_env = result.get("env", {})
+            if not isinstance(local_env, dict):
+                local_env = {}
+            for key in RECOMMENDED_ENV_KEYS:
+                if key in remote_rec_env:
+                    local_env[key] = remote_rec_env[key]
+            result["env"] = local_env
+        return result
 
 
 # =============================================================================
@@ -3734,6 +3769,38 @@ class ClaudeSync:
         self.output.header("Pull status (repo -> home)")
         self.output.print_changes(pull_diff, "pull")
 
+        # Capability summary from manifest (if it exists)
+        cap_path = self.paths.repo_claude / ".claude-sync-capabilities.json"
+        cap_data = None
+        if cap_path.exists():
+            try:
+                with open(cap_path) as f:
+                    cap_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if cap_data and "counts" in cap_data:
+            counts = cap_data["counts"]
+            self.output.header("Capabilities")
+            for cat in ("agents", "skills", "plugins", "rules", "worksets", "hooks", "scripts"):
+                n = counts.get(cat, 0)
+                if n > 0:
+                    extra = ""
+                    # Show plugin names inline
+                    if cat == "plugins" and cap_data.get("plugins"):
+                        names = ", ".join(sorted(cap_data["plugins"].keys()))
+                        extra = f" ({names})"
+                    self.output.info(f"  {cat + ':':<14}{n} synced{extra}")
+
+            # Cowork/Agent Teams status
+            settings = cap_data.get("settings", {})
+            if settings.get("teammateMode") or settings.get("cowork_enabled"):
+                self.output.header("Cowork/Agent Teams")
+                if "teammateMode" in settings:
+                    self.output.info(f"  teammateMode:    {settings['teammateMode']} (synced)")
+                if settings.get("cowork_enabled"):
+                    self.output.info("  agent_teams:     enabled (synced, experimental)")
+
         if self.output.json_mode:
             self.output.set_json("push_changes", push_diff.to_dict())
             self.output.set_json("pull_changes", pull_diff.to_dict())
@@ -3743,6 +3810,8 @@ class ClaudeSync:
                 "file_count": len(manifest.files),
                 "last_push": manifest.last_push,
             })
+            if cap_data:
+                self.output.set_json("capabilities", cap_data)
 
         if push_diff.has_changes or pull_diff.has_changes:
             return ExitCode.DIRTY
@@ -3898,6 +3967,20 @@ class ClaudeSync:
                     json.dump(portable, f, indent=2, sort_keys=True)
                     f.write("\n")
                 self.output.detail("Pushed portable settings")
+
+        # Generate capability manifest (semantic layer for GUI, MCP, status)
+        cap_manifest = self._generate_capability_manifest(home_hashes)
+        cap_path = self.paths.repo_claude / ".claude-sync-capabilities.json"
+        cap_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cap_path, "w") as f:
+            json.dump(cap_manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        self.output.detail(
+            f"Generated capability manifest "
+            f"({cap_manifest['counts'].get('agents', 0)} agents, "
+            f"{cap_manifest['counts'].get('skills', 0)} skills, "
+            f"{cap_manifest['counts'].get('plugins', 0)} plugins)"
+        )
 
         # Update manifest with new file state and history
         new_repo_hashes = FileHasher.walk_directory(self.paths.repo_claude)
@@ -5183,6 +5266,126 @@ class ClaudeSync:
                     json.dump(assembled, f, indent=2, sort_keys=True)
                     f.write("\n")
                 self.output.detail("Assembled skill-rules.json from per-skill triggers (repo)")
+
+    def _generate_capability_manifest(self, home_hashes: Dict[str, str]) -> Dict[str, Any]:
+        """Generate a structured capability manifest from the synced config.
+
+        Captures *what* a machine can do — agents, skills, plugins, rules, worksets,
+        and cowork settings — as a semantic layer on top of the raw file hashes.
+        Used by status output, MCP server, and future GUI.
+        """
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        manifest: Dict[str, Any] = {
+            "version": "1.3.0",
+            "generated": now,
+            "source": {
+                "hostname": platform.node(),
+                "platform": sys.platform,
+            },
+            "agents": {},
+            "skills": {},
+            "plugins": {},
+            "rules": [],
+            "worksets": [],
+            "settings": {},
+            "counts": {},
+        }
+
+        # Parse agent/skill frontmatter using EcosystemAnalyzer's approach
+        for path in home_hashes:
+            full_path = self.paths.home_claude / path
+            if not full_path.exists():
+                continue
+
+            if path.startswith("agents/") and path.endswith(".md"):
+                slug = Path(path).stem
+                try:
+                    content = full_path.read_text(encoding="utf-8", errors="replace")
+                    meta = self._parse_frontmatter(content)
+                    manifest["agents"][meta.get("name", slug)] = {
+                        "description": meta.get("description", ""),
+                        "model": meta.get("model", ""),
+                    }
+                except OSError:
+                    manifest["agents"][slug] = {}
+
+            elif path.startswith("skills/") and path.endswith("SKILL.md"):
+                parts = Path(path).parts
+                slug = parts[1] if len(parts) > 2 else Path(path).stem
+                try:
+                    content = full_path.read_text(encoding="utf-8", errors="replace")
+                    meta = self._parse_frontmatter(content)
+                    entry: Dict[str, Any] = {"description": meta.get("description", "")}
+                    if "triggers" in meta:
+                        entry["triggers"] = [t.strip() for t in meta["triggers"].split(",")]
+                    manifest["skills"][meta.get("name", slug)] = entry
+                except OSError:
+                    manifest["skills"][slug] = {}
+
+            elif path.startswith("rules/") and path.endswith(".md"):
+                manifest["rules"].append(Path(path).stem)
+
+        # Collect plugins (directory names under plugins/)
+        plugins_dir = self.paths.home_claude / "plugins"
+        if plugins_dir.exists() and plugins_dir.is_dir():
+            for entry in sorted(plugins_dir.iterdir()):
+                if entry.is_dir():
+                    manifest["plugins"][entry.name] = {"enabled": True}
+
+        # Collect worksets (json files under worksets/, excluding state files)
+        worksets_dir = self.paths.home_claude / "worksets"
+        if worksets_dir.exists() and worksets_dir.is_dir():
+            for entry in sorted(worksets_dir.iterdir()):
+                if entry.suffix == ".json" and entry.name not in ("_state.json", "_affinity.json"):
+                    manifest["worksets"].append(entry.stem)
+
+        # Read portable settings for cowork config
+        settings_path = self.paths.home_claude / "settings.json"
+        if settings_path.exists():
+            try:
+                with open(settings_path) as f:
+                    settings = json.load(f)
+                if "teammateMode" in settings:
+                    manifest["settings"]["teammateMode"] = settings["teammateMode"]
+                env = settings.get("env", {})
+                if isinstance(env, dict):
+                    manifest["settings"]["cowork_enabled"] = bool(
+                        env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Count files per category from home_hashes
+        counts: Dict[str, int] = {}
+        for path in home_hashes:
+            cat = path.split("/")[0] if "/" in path else "root"
+            counts[cat] = counts.get(cat, 0) + 1
+        manifest["counts"] = {
+            "agents": len(manifest["agents"]),
+            "skills": len(manifest["skills"]),
+            "rules": len(manifest["rules"]),
+            "plugins": len(manifest["plugins"]),
+            "worksets": len(manifest["worksets"]),
+            "hooks": counts.get("hooks", 0),
+            "scripts": counts.get("scripts", 0),
+        }
+
+        manifest["rules"].sort()
+        return manifest
+
+    @staticmethod
+    def _parse_frontmatter(content: str) -> Dict[str, str]:
+        """Extract YAML frontmatter fields from markdown content."""
+        meta: Dict[str, str] = {}
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end > 0:
+                fm = content[3:end]
+                for line in fm.strip().splitlines():
+                    if ":" in line:
+                        key, _, val = line.partition(":")
+                        meta[key.strip()] = val.strip().strip('"').strip("'")
+        return meta
 
     def _filter_derived_artifacts(self, diff_result: DiffResult) -> bool:
         """Remove derived artifacts (skill-rules.json) from diff when atomized triggers exist.
