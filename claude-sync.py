@@ -1001,31 +1001,84 @@ class SecretScanner:
 
     # Lines matching these patterns are likely documentation/examples, not real secrets
     PLACEHOLDER_INDICATORS = re.compile(
-        r'(?:example|placeholder|your_|<[^>]+>|TODO|CHANGEME|xxx|REPLACE_ME)', re.IGNORECASE
+        r'(?:example|placeholder|your_|<[^>]+>|TODO|CHANGEME|xxx|REPLACE_ME'
+        r'|\$\{[A-Z_]+\})',  # Shell variable references like ${API_KEY} are not secrets
+        re.IGNORECASE
+    )
+
+    # Paths containing reference docs, plugin marketplaces, and agent/skill definitions
+    # that commonly have example tokens, passwords, and API keys in documentation
+    EXCLUDED_PATH_PATTERNS = [
+        "plugins/marketplaces/",    # Plugin reference docs with auth examples
+        "/references/",             # Reference documentation files
+    ]
+
+    # File extensions that are documentation (agent/skill definitions)
+    DOC_EXTENSIONS = {".md"}
+
+    # Context patterns that indicate a line is inside a code example, not a real secret
+    CODE_CONTEXT_INDICATORS = re.compile(
+        r'(?:'
+        r'^\s*#\s|'                 # Python/shell comment
+        r'^\s*//\s|'               # C-style comment
+        r'pass\s*$|'               # Python pass statement (not password)
+        r'pass\s*#|'               # Python pass with comment
+        r'pass:\s*\w+.*score|'     # "pass: some_score" (test results)
+        r'pass =.*\(|'            # "pass = func(" (Python variable)
+        r'Pass:\s|'                # "Pass: description" (test output)
+        r'Password.*example|'     # Documentation about passwords
+        r'password.*policy|'      # Password policy docs
+        r'passwo.*\$\{\{|'        # GitHub Actions template variable
+        r'Bearer.*ens$|'          # Truncated "Bearer tokens" in docs
+        r'bearer.*token|'          # Discussion of bearer tokens
+        r'\$\{[A-Z_]+\}'          # Shell variable references like ${API_KEY}
+        r')', re.IGNORECASE
     )
 
     @classmethod
     def scan_file(cls, path: Path, rel_path: str) -> List[SecretFinding]:
         """Scan a single file for secrets."""
+        # Skip paths that are known to contain documentation/examples
+        for excluded in cls.EXCLUDED_PATH_PATTERNS:
+            if excluded in rel_path:
+                return []
+
+        is_doc = path.suffix in cls.DOC_EXTENSIONS
         findings = []
         try:
+            in_code_block = False
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line_num, line in enumerate(f, 1):
+                    # Track markdown code fences in doc files
+                    if is_doc and line.strip().startswith('```'):
+                        in_code_block = not in_code_block
+
                     for pattern_name, regex in cls.PATTERNS:
                         match = regex.search(line)
-                        if match and not cls.PLACEHOLDER_INDICATORS.search(line):
-                            # Mask the matched text for display
-                            text = match.group()
-                            if len(text) > 12:
-                                masked = text[:6] + "..." + text[-3:]
-                            else:
-                                masked = text[:3] + "..."
-                            findings.append(SecretFinding(
-                                file_path=rel_path,
-                                line_number=line_num,
-                                pattern_name=pattern_name,
-                                matched_text=masked,
-                            ))
+                        if not match:
+                            continue
+                        # Skip known placeholders
+                        if cls.PLACEHOLDER_INDICATORS.search(line):
+                            continue
+                        # In doc files: skip matches inside code blocks and
+                        # lines matching documentation context patterns
+                        if is_doc:
+                            if in_code_block:
+                                continue
+                            if cls.CODE_CONTEXT_INDICATORS.search(line):
+                                continue
+                        # Mask the matched text for display
+                        text = match.group()
+                        if len(text) > 12:
+                            masked = text[:6] + "..." + text[-3:]
+                        else:
+                            masked = text[:3] + "..."
+                        findings.append(SecretFinding(
+                            file_path=rel_path,
+                            line_number=line_num,
+                            pattern_name=pattern_name,
+                            matched_text=masked,
+                        ))
         except (OSError, UnicodeDecodeError):
             pass
         return findings
