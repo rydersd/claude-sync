@@ -37,11 +37,26 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: mislav/bump-homebrew-formula-action@v3
-        with:
-          formula-name: claude-sync
-          homebrew-tap: rydersd/homebrew-tools
-          tag-name: ${{ github.ref_name }}
-          download-url: https://github.com/rydersd/claudeTools/archive/refs/tags/${{ github.ref_name }}.tar.gz
+      - name: Compute sha256
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF##refs/tags/}"
+          SHA256=$(
+            curl -fsSL \
+              "https://github.com/${{ github.repository }}/archive/refs/tags/${VERSION}.tar.gz" \
+              | shasum -a 256 \
+              | awk '{ print $1 }'
+          )
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "Computed sha256 for ${VERSION}: ${SHA256}"
+
+      - name: Dispatch formula bump to tap
+        run: |
+          gh workflow run bump-formula.yml \
+            --repo rydersd/homebrew-tools \
+            --ref main \
+            --field version="${{ steps.meta.outputs.version }}" \
+            --field sha256="${{ steps.meta.outputs.sha256 }}"
         env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
