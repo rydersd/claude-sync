@@ -3530,6 +3530,11 @@ class ClaudeSync:
             "release": self._cmd_release,
             "install": self._cmd_install,
             "uninstall": self._cmd_uninstall,
+            "search": self._cmd_search,
+            "update": self._cmd_update,
+            "compose": self._cmd_compose,
+            "audit": self._cmd_audit,
+            "hub": self._cmd_hub,
         }
         handler = handlers.get(self.args.command)
         if handler:
@@ -3769,6 +3774,48 @@ class ClaudeSync:
         uninstall_p = subparsers.add_parser("uninstall", help="Remove installed agents/skills")
         uninstall_p.add_argument("name", nargs="?", help="Name of agent/skill to remove")
         uninstall_p.add_argument("--from", dest="from_source", help="Remove all items from a source repo")
+
+        # search
+        search_p = subparsers.add_parser("search", help="Full-text search across agents, skills, and rules")
+        search_p.add_argument("query", nargs="+", help="Search terms")
+        search_p.add_argument("--type", dest="search_type", choices=["agent", "skill", "rule", "all"], default="all", help="Filter by type")
+        search_p.add_argument("--tag", help="Filter by tag")
+        search_p.add_argument("--from", dest="from_source", help="Filter by provenance (owner/repo)")
+        search_p.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+
+        # update
+        update_p = subparsers.add_parser("update", help="Check installed items for updates from source repos")
+        update_p.add_argument("name", nargs="?", help="Name of item to update")
+        update_p.add_argument("--all", action="store_true", help="Update all installed items")
+        update_p.add_argument("--dry-run", action="store_true", help="Show changes without applying")
+        update_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+
+        # compose
+        compose_p = subparsers.add_parser("compose", help="Merge agents/skills into a composite")
+        compose_p.add_argument("name", help="Name for the composite")
+        compose_p.add_argument("--agents", help="Comma-separated agent names to merge")
+        compose_p.add_argument("--skills", help="Comma-separated skill names to merge")
+        compose_p.add_argument("--type", dest="compose_type", choices=["agent", "skill"], default="agent", help="Type of composite (default: agent)")
+        compose_p.add_argument("--description", help="Description for the composite")
+        compose_p.add_argument("--dry-run", action="store_true", help="Print result without writing")
+
+        # audit
+        audit_p = subparsers.add_parser("audit", help="Security and quality audit of agents/skills/rules")
+        audit_p.add_argument("name", nargs="?", help="Name of specific item to audit")
+        audit_p.add_argument("--fix", action="store_true", help="Auto-fix issues where possible")
+        audit_p.add_argument("--severity", choices=["all", "critical", "warning", "info"], default="all", help="Filter by severity (default: all)")
+
+        # hub
+        hub_p = subparsers.add_parser("hub", help="Discover and browse agent/skill repos")
+        hub_sub = hub_p.add_subparsers(dest="hub_command", help="Hub subcommands")
+        hub_browse = hub_sub.add_parser("browse", help="Browse available repos")
+        hub_search = hub_sub.add_parser("search", help="Search repos by keyword")
+        hub_search.add_argument("query", nargs="+", help="Search terms")
+        hub_info = hub_sub.add_parser("info", help="Show details for a repo")
+        hub_info.add_argument("repo", help="Repo in owner/name format")
+        hub_add = hub_sub.add_parser("add", help="Add a repo to the hub index")
+        hub_add.add_argument("repo", help="Repo in owner/name format")
+        hub_sub.add_parser("refresh", help="Refresh the hub index cache")
 
         return parser
 
@@ -6385,6 +6432,849 @@ class ClaudeSync:
         else:
             self.output.warning("Nothing found to remove.")
         return ExitCode.OK
+
+    # ---- Searchable file collection (shared helper) ----
+
+    def _collect_searchable_files(self) -> list:
+        """Collect all agent, skill, and rule files with parsed metadata."""
+        results = []
+        for item_type, dirname in [("agent", "agents"), ("skill", "skills"), ("rule", "rules")]:
+            base = self.paths.home_claude / dirname
+            if not base.is_dir():
+                continue
+            for entry in sorted(base.iterdir()):
+                if entry.is_file() and entry.suffix == ".md":
+                    file_path = entry
+                elif entry.is_dir() and (entry / "SKILL.md").is_file():
+                    file_path = entry / "SKILL.md"
+                else:
+                    continue
+                try:
+                    content = file_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                # Parse frontmatter
+                metadata: Dict[str, Any] = {}
+                fm_match = _FRONTMATTER_RE.match(content)
+                if fm_match:
+                    for line in fm_match.group(1).splitlines():
+                        if ":" in line:
+                            key, _, val = line.partition(":")
+                            key = key.strip()
+                            val = val.strip().strip('"').strip("'")
+                            if key == "tags":
+                                # Parse comma-separated or bracketed list
+                                val = val.strip("[]")
+                                metadata[key] = [t.strip() for t in val.split(",") if t.strip()]
+                            else:
+                                metadata[key] = val
+                if "tags" not in metadata:
+                    metadata["tags"] = []
+                name = entry.stem if entry.is_file() else entry.name
+                results.append({
+                    "path": str(file_path.relative_to(self.paths.home_claude)),
+                    "abs_path": file_path,
+                    "type": item_type,
+                    "name": name,
+                    "content": content,
+                    "metadata": metadata,
+                })
+        return results
+
+    # ---- search command ----
+
+    def _cmd_search(self) -> int:
+        """Full-text search across agents, skills, and rules with TF-IDF ranking."""
+        import math
+
+        query_terms = self.args.query
+        search_type = getattr(self.args, "search_type", "all")
+        tag_filter = getattr(self.args, "tag", None)
+        from_filter = getattr(self.args, "from_source", None)
+        limit = getattr(self.args, "limit", 20)
+
+        self.output.header("Search")
+
+        all_files = self._collect_searchable_files()
+        if not all_files:
+            self.output.warning("No agents, skills, or rules found.")
+            return ExitCode.OK
+
+        # Filter by type
+        if search_type != "all":
+            all_files = [f for f in all_files if f["type"] == search_type]
+
+        # Filter by tag
+        if tag_filter:
+            all_files = [f for f in all_files if tag_filter.lower() in [t.lower() for t in f["metadata"].get("tags", [])]]
+
+        # Filter by provenance
+        if from_filter:
+            all_files = [f for f in all_files if from_filter.lower() in f["metadata"].get("installed_from", "").lower()]
+
+        if not all_files:
+            self.output.info("  No items match the filters.")
+            return ExitCode.OK
+
+        # Tokenize query, filter stop words
+        tokens = [t.lower() for t in " ".join(query_terms).split() if t.lower() not in EcosystemAnalyzer.STOP_WORDS]
+        if not tokens:
+            self.output.warning("Query consists entirely of stop words.")
+            return ExitCode.OK
+
+        total_docs = len(all_files)
+
+        # Count document frequency for each term
+        doc_freq: Dict[str, int] = {}
+        for token in tokens:
+            count = 0
+            for f in all_files:
+                text = (f["name"] + " " + f["metadata"].get("description", "") + " " + f["content"]).lower()
+                if token in text:
+                    count += 1
+            doc_freq[token] = count
+
+        # Compute TF-IDF score per document
+        scored = []
+        for f in all_files:
+            content_lower = f["content"].lower()
+            name_desc = (f["name"] + " " + f["metadata"].get("description", "")).lower()
+            score = 0.0
+            match_line = ""
+            for token in tokens:
+                # Term frequency in full content
+                tf = content_lower.count(token)
+                # Boost 2x for name/description matches
+                tf += name_desc.count(token) * 2
+                if tf == 0:
+                    continue
+                idf = math.log(total_docs / (1 + doc_freq.get(token, 0)))
+                score += tf * idf
+                # Find snippet line
+                if not match_line:
+                    for line in f["content"].splitlines():
+                        if token in line.lower():
+                            match_line = line.strip()[:80]
+                            break
+            if score > 0:
+                scored.append((score, f, match_line))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        scored = scored[:limit]
+
+        if not scored:
+            self.output.info("  No results found.")
+            if self.output.json_mode:
+                self.output.set_json("results", [])
+            return ExitCode.OK
+
+        # Display results
+        if self.output.json_mode:
+            json_results = []
+            for score, f, snippet in scored:
+                json_results.append({
+                    "score": round(score, 3),
+                    "type": f["type"],
+                    "name": f["name"],
+                    "path": f["path"],
+                    "snippet": snippet,
+                    "metadata": f["metadata"],
+                })
+            self.output.set_json("results", json_results)
+            self.output.set_json("total", len(json_results))
+        else:
+            self.output.info(f"  Found {len(scored)} result(s):\n")
+            for score, f, snippet in scored:
+                badge = f"[{f['type']}]"
+                self.output.info(f"  {score:6.2f}  {badge:8s}  {f['name']}")
+                if snippet:
+                    self.output.info(f"           {snippet}")
+
+        return ExitCode.OK
+
+    # ---- update command ----
+
+    def _cmd_update(self) -> int:
+        """Check installed items for updates from source repos."""
+        target_name = getattr(self.args, "name", None)
+        update_all = getattr(self.args, "all", False)
+        dry_run = getattr(self.args, "dry_run", False)
+        yes = getattr(self.args, "yes", False)
+
+        self.output.header("Update")
+
+        all_files = self._collect_searchable_files()
+        # Filter to items with provenance
+        updatable = [f for f in all_files if f["metadata"].get("installed_from")]
+
+        if target_name:
+            updatable = [f for f in updatable if f["name"] == target_name]
+            if not updatable:
+                self.output.error(f"No installed item named '{target_name}' with provenance found.")
+                return ExitCode.ERROR
+
+        if not updatable:
+            self.output.info("  No installed items with provenance to check.")
+            return ExitCode.OK
+
+        # Group by source repo
+        by_repo: Dict[str, list] = {}
+        for f in updatable:
+            source = f["metadata"]["installed_from"]
+            by_repo.setdefault(source, []).append(f)
+
+        checked = 0
+        updates_available = 0
+        updated = 0
+
+        for source, items in by_repo.items():
+            try:
+                owner, repo = self._parse_github_source(source)
+            except ValueError:
+                self.output.warning(f"  Invalid source '{source}', skipping.")
+                continue
+
+            for f in items:
+                checked += 1
+                remote_path = f["path"]
+                # Determine the remote path from original install
+                # Try common paths: claude/<type>s/<name>.md, <type>s/<name>.md
+                type_dir = f["type"] + "s"
+                filename = f["name"] + ".md"
+                if f["abs_path"].name == "SKILL.md":
+                    filename = f["name"] + "/SKILL.md"
+
+                remote_content = None
+                for prefix in ["claude/", ""]:
+                    try:
+                        remote_content = self._fetch_raw_file(owner, repo, f"{prefix}{type_dir}/{filename}")
+                        if remote_content:
+                            break
+                    except Exception:
+                        continue
+
+                if remote_content is None:
+                    self.output.warning(f"  Could not fetch {f['name']} from {source}")
+                    continue
+
+                # Compare hashes — strip provenance from frontmatter only (not body)
+                def _strip_provenance(text: str) -> str:
+                    fm = _FRONTMATTER_RE.match(text)
+                    if not fm:
+                        return text.rstrip()
+                    fm_text = fm.group(1)
+                    body = text[fm.end():]
+                    fm_lines = [l for l in fm_text.split('\n')
+                                if not l.startswith('installed_from:') and not l.startswith('installed_at:')]
+                    return ("---\n" + "\n".join(fm_lines) + "\n---" + body).rstrip()
+
+                local_stripped = _strip_provenance(f["content"])
+                remote_stripped = _strip_provenance(remote_content)
+                local_hash = hashlib.sha256(local_stripped.encode("utf-8")).hexdigest()
+                remote_hash = hashlib.sha256(remote_stripped.encode("utf-8")).hexdigest()
+
+                if local_hash == remote_hash:
+                    self.output.detail(f"  {f['name']}: up to date")
+                    continue
+
+                updates_available += 1
+                self.output.info(f"\n  Update available: {f['name']} ({f['type']})")
+
+                # Show diff preview
+                local_lines = local_stripped.splitlines(keepends=True)
+                remote_lines = remote_stripped.splitlines(keepends=True)
+                diff = list(difflib.unified_diff(local_lines, remote_lines, fromfile="local", tofile="remote"))
+                if diff:
+                    for line in diff[:15]:
+                        self.output.info(f"    {line.rstrip()}")
+                    if len(diff) > 15:
+                        self.output.info(f"    ... ({len(diff) - 15} more lines)")
+
+                if dry_run:
+                    continue
+
+                # Confirm update
+                should_update = update_all or yes
+                if not should_update:
+                    should_update = self.output.confirm(f"Apply update to {f['name']}?")
+
+                if should_update:
+                    # Re-add provenance to remote content
+                    fm_match = _FRONTMATTER_RE.match(remote_content)
+                    if fm_match:
+                        fm = fm_match.group(1)
+                        body = remote_content[fm_match.end():]
+                        fm_lines = [l for l in fm.split('\n') if not l.startswith('installed_from:') and not l.startswith('installed_at:')]
+                        safe_source = f"{owner}/{repo}".replace("\n", "").replace("\r", "")
+                        fm_lines.append(f"installed_from: {safe_source}")
+                        fm_lines.append(f"installed_at: {_utcnow_iso()}")
+                        new_content = f"---\n" + "\n".join(fm_lines) + f"\n---{body}"
+                    else:
+                        new_content = remote_content
+
+                    f["abs_path"].write_text(new_content, encoding="utf-8")
+                    updated += 1
+                    self.output.success(f"Updated {f['name']}")
+
+        self.output.info(f"\n  Checked: {checked}, Available: {updates_available}, Updated: {updated}")
+
+        if self.output.json_mode:
+            self.output.set_json("checked", checked)
+            self.output.set_json("updates_available", updates_available)
+            self.output.set_json("updated", updated)
+
+        return ExitCode.OK
+
+    # ---- compose command ----
+
+    def _cmd_compose(self) -> int:
+        """Merge multiple agents/skills into a composite."""
+        name = self.args.name
+        agents_arg = getattr(self.args, "agents", None)
+        skills_arg = getattr(self.args, "skills", None)
+        compose_type = getattr(self.args, "compose_type", "agent")
+        description = getattr(self.args, "description", None)
+        dry_run = getattr(self.args, "dry_run", False)
+
+        self.output.header("Compose")
+
+        if not agents_arg and not skills_arg:
+            self.output.error("Provide --agents and/or --skills (comma-separated names).")
+            return ExitCode.ERROR
+
+        all_files = self._collect_searchable_files()
+        file_map = {(f["type"], f["name"]): f for f in all_files}
+
+        # Collect source files
+        sources = []
+        missing = []
+        if agents_arg:
+            for a in agents_arg.split(","):
+                a = a.strip()
+                if ("agent", a) in file_map:
+                    sources.append(file_map[("agent", a)])
+                else:
+                    missing.append(f"agent/{a}")
+        if skills_arg:
+            for s in skills_arg.split(","):
+                s = s.strip()
+                if ("skill", s) in file_map:
+                    sources.append(file_map[("skill", s)])
+                else:
+                    missing.append(f"skill/{s}")
+
+        if missing:
+            self.output.error(f"Not found: {', '.join(missing)}")
+            return ExitCode.ERROR
+
+        if not sources:
+            self.output.error("No source items to compose.")
+            return ExitCode.ERROR
+
+        # Parse sections from each source
+        all_tools: List[str] = []
+        all_tags: List[str] = []
+        composed_from: List[str] = []
+        sections: List[Tuple[str, str, str]] = []  # (heading, content, source_name)
+        seen_hashes: Set[str] = set()
+
+        for src in sources:
+            composed_from.append(src["name"])
+            # Collect tools from metadata
+            tools_str = src["metadata"].get("allowed-tools", "")
+            if tools_str:
+                for t in tools_str.strip("[]").split(","):
+                    t = t.strip()
+                    if t and t not in all_tools:
+                        all_tools.append(t)
+            # Collect tags
+            for t in src["metadata"].get("tags", []):
+                if t not in all_tags:
+                    all_tags.append(t)
+
+            # Split body on ## headings
+            content = src["content"]
+            fm_match = _FRONTMATTER_RE.match(content)
+            body = content[fm_match.end():] if fm_match else content
+            body = body.lstrip("\n")
+
+            # Split into sections
+            current_heading = ""
+            current_lines: List[str] = []
+            for line in body.splitlines(keepends=True):
+                if line.startswith("## "):
+                    if current_heading or current_lines:
+                        section_text = "".join(current_lines)
+                        section_hash = hashlib.sha256(section_text.strip().encode()).hexdigest()
+                        if section_hash not in seen_hashes:
+                            seen_hashes.add(section_hash)
+                            sections.append((current_heading, section_text, src["name"]))
+                    current_heading = line.rstrip("\n")
+                    current_lines = []
+                else:
+                    current_lines.append(line)
+            # Last section
+            if current_heading or current_lines:
+                section_text = "".join(current_lines)
+                section_hash = hashlib.sha256(section_text.strip().encode()).hexdigest()
+                if section_hash not in seen_hashes:
+                    seen_hashes.add(section_hash)
+                    sections.append((current_heading, section_text, src["name"]))
+
+        # Build composite
+        if not description:
+            desc_parts = [src["metadata"].get("description", src["name"]) for src in sources]
+            description = "Composite of: " + ", ".join(desc_parts)
+
+        fm_lines = [
+            f"name: {name}",
+            f"description: {description}",
+        ]
+        if all_tools:
+            fm_lines.append(f"allowed-tools: [{', '.join(all_tools)}]")
+        if all_tags:
+            fm_lines.append(f"tags: [{', '.join(all_tags)}]")
+        fm_lines.append(f"composed_from: [{', '.join(composed_from)}]")
+
+        composite = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
+        for heading, section_text, source_name in sections:
+            composite += f"<!-- From: {source_name} -->\n"
+            if heading:
+                composite += heading + "\n"
+            composite += section_text
+            if not section_text.endswith("\n"):
+                composite += "\n"
+            composite += "\n"
+
+        if dry_run:
+            self.output.info("  Dry run — composite output:\n")
+            for line in composite.splitlines():
+                self.output.info(f"  {line}")
+            return ExitCode.OK
+
+        # Write composite
+        category = compose_type + "s"
+        if not self._is_safe_name(name):
+            self.output.error(f"Unsafe name: {name}")
+            return ExitCode.ERROR
+
+        overlap = self._check_overlap(name, category)
+        if overlap:
+            self.output.warning(f"  {name} already exists in {category}/")
+            if not self.output.confirm("Overwrite?"):
+                self.output.info("  Cancelled.")
+                return ExitCode.OK
+
+        dest = self.paths.home_claude / category / f"{name}.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(composite, encoding="utf-8")
+        self.output.success(f"Created {category}/{name}.md ({len(sources)} sources merged)")
+
+        if self.output.json_mode:
+            self.output.set_json("name", name)
+            self.output.set_json("type", compose_type)
+            self.output.set_json("sources", composed_from)
+            self.output.set_json("path", str(dest))
+
+        return ExitCode.OK
+
+    # ---- audit command ----
+
+    def _cmd_audit(self) -> int:
+        """Security and quality audit of agents, skills, and rules."""
+        target_name = getattr(self.args, "name", None)
+        fix_mode = getattr(self.args, "fix", False)
+        severity_filter = getattr(self.args, "severity", "all")
+
+        self.output.header("Audit")
+
+        all_files = self._collect_searchable_files()
+        if target_name:
+            all_files = [f for f in all_files if f["name"] == target_name]
+            if not all_files:
+                self.output.error(f"No item named '{target_name}' found.")
+                return ExitCode.ERROR
+
+        if not all_files:
+            self.output.warning("No agents, skills, or rules found.")
+            return ExitCode.OK
+
+        total_score = 0
+        total_items = 0
+        all_findings: List[Tuple[str, str, str, str]] = []  # (item_name, severity, check, message)
+        fixed_count = 0
+
+        for f in all_files:
+            findings: List[Tuple[str, str, str]] = []  # (severity, check, message)
+            content = f["content"]
+            metadata = f["metadata"]
+            fm_match = _FRONTMATTER_RE.match(content)
+            body = content[fm_match.end():] if fm_match else content
+
+            # CRITICAL: wildcard_tools
+            tools_str = metadata.get("allowed-tools", "")
+            if tools_str:
+                tool_list = [t.strip() for t in tools_str.strip("[]").split(",") if t.strip()]
+                if "*" in tool_list:
+                    findings.append(("CRITICAL", "wildcard_tools", "allowed-tools contains wildcard '*'"))
+                elif len(tool_list) > 8:
+                    findings.append(("CRITICAL", "wildcard_tools", f"allowed-tools has {len(tool_list)} tools (>8 is suspicious)"))
+
+            # CRITICAL: suspicious_content — check code blocks only to avoid false positives in docs
+            # Extract code blocks from body (fenced with ```)
+            code_blocks = re.findall(r'```[^\n]*\n(.*?)```', body, re.DOTALL)
+            code_content = "\n".join(code_blocks) if code_blocks else ""
+            suspicious_patterns = [
+                (r'curl\s+.*-X\s*POST\b|curl\s+.*--data', "curl POST request in code block"),
+                (r'\beval\s*\(', "eval() call in code block"),
+                (r'\bexec\s*\(', "exec() call in code block"),
+                (r'base64.*encode|base64\.b64encode', "base64 encoding in code block"),
+                (r'ngrok\.io|webhook\.site', "Suspicious URL (ngrok/webhook.site) detected"),
+            ]
+            for pattern, msg in suspicious_patterns:
+                # Check code blocks for most patterns, full body for URL patterns
+                search_in = body if "ngrok" in pattern else code_content
+                if re.search(pattern, search_in, re.IGNORECASE):
+                    findings.append(("CRITICAL", "suspicious_content", msg))
+
+            # WARNING: missing_description
+            if not metadata.get("description"):
+                findings.append(("WARNING", "missing_description", "No description in frontmatter"))
+
+            # WARNING: missing_name
+            if not metadata.get("name"):
+                findings.append(("WARNING", "missing_name", "No name in frontmatter"))
+
+            # WARNING: empty_body
+            if len(body.strip()) < 50:
+                findings.append(("WARNING", "empty_body", f"Body is very short ({len(body.strip())} chars after frontmatter)"))
+
+            # WARNING: oversized
+            try:
+                size = f["abs_path"].stat().st_size
+                if size > 50 * 1024:
+                    findings.append(("WARNING", "oversized", f"File is {size // 1024}KB (>50KB)"))
+            except OSError:
+                pass
+
+            # INFO: stale_provenance
+            installed_at = metadata.get("installed_at", "")
+            if installed_at:
+                try:
+                    installed_dt = datetime.datetime.strptime(installed_at.rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+                    age_days = (_utcnow() - installed_dt).days
+                    if age_days > 180:
+                        findings.append(("INFO", "stale_provenance", f"Installed {age_days} days ago (>180 days)"))
+                except (ValueError, TypeError):
+                    pass
+
+            # INFO: invalid_provenance
+            installed_from = metadata.get("installed_from", "")
+            if installed_from:
+                try:
+                    self._parse_github_source(installed_from)
+                except ValueError:
+                    findings.append(("INFO", "invalid_provenance", f"Invalid source format: {installed_from}"))
+
+            # Compute score
+            score = 100
+            for sev, _, _ in findings:
+                if sev == "CRITICAL":
+                    score -= 30
+                elif sev == "WARNING":
+                    score -= 10
+                elif sev == "INFO":
+                    score -= 5
+            score = max(0, score)
+            total_score += score
+            total_items += 1
+
+            # Apply severity filter
+            for sev, check, msg in findings:
+                if severity_filter == "all" or sev.lower() == severity_filter:
+                    all_findings.append((f["name"], sev, check, msg))
+
+            # --fix: add placeholder description where missing
+            if fix_mode and not metadata.get("description"):
+                fm_match_fix = _FRONTMATTER_RE.match(content)
+                if fm_match_fix:
+                    fm_text = fm_match_fix.group(1)
+                    rest = content[fm_match_fix.end():]
+                    new_fm = fm_text + f"\ndescription: TODO - add description for {f['name']}"
+                    new_content = f"---\n{new_fm}\n---{rest}"
+                    try:
+                        f["abs_path"].write_text(new_content, encoding="utf-8")
+                        fixed_count += 1
+                    except OSError as e:
+                        self.output.warning(f"  Could not fix {f['name']}: {e}")
+
+        # Display findings grouped by severity
+        if self.output.json_mode:
+            json_findings = []
+            for item_name, sev, check, msg in all_findings:
+                json_findings.append({
+                    "item": item_name,
+                    "severity": sev,
+                    "check": check,
+                    "message": msg,
+                })
+            avg_score = round(total_score / total_items, 1) if total_items else 0
+            self.output.set_json("findings", json_findings)
+            self.output.set_json("total_items", total_items)
+            self.output.set_json("average_score", avg_score)
+            self.output.set_json("fixed", fixed_count)
+        else:
+            if not all_findings:
+                self.output.success("No issues found.")
+            else:
+                for sev_label in ["CRITICAL", "WARNING", "INFO"]:
+                    group = [(n, c, m) for n, s, c, m in all_findings if s == sev_label]
+                    if group:
+                        self.output.info(f"\n  {sev_label} ({len(group)}):")
+                        for item_name, check, msg in group:
+                            self.output.info(f"    {item_name}: [{check}] {msg}")
+
+            avg_score = round(total_score / total_items, 1) if total_items else 0
+            self.output.info(f"\n  Summary: {total_items} item(s), average score: {avg_score}/100")
+            if fixed_count:
+                self.output.success(f"Fixed {fixed_count} issue(s)")
+
+        return ExitCode.OK
+
+    # ---- hub command ----
+
+    def _cmd_hub(self) -> int:
+        """Discover and browse agent/skill repos."""
+        hub_command = getattr(self.args, "hub_command", None)
+        if not hub_command:
+            self.output.info("  Usage: claude-sync hub {browse|search|info|add|refresh}")
+            return ExitCode.OK
+
+        cache_dir = self.paths.home_claude / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / "hub-index.json"
+
+        def _load_index() -> dict:
+            """Load hub index from cache, fetching if needed."""
+            if cache_path.is_file():
+                try:
+                    return json.loads(cache_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    pass
+            return _fetch_index()
+
+        def _fetch_index() -> dict:
+            """Fetch hub index from remote, with graceful fallback."""
+            try:
+                import urllib.request
+                url = "https://raw.githubusercontent.com/claude-sync/hub-index/main/index.json"
+                req = urllib.request.Request(url, headers={"User-Agent": "claude-sync"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    raw_repos = data if isinstance(data, list) else data.get("repos", [])
+                    # Validate entries: each must be a dict with a "repo" string key
+                    valid_repos = [r for r in raw_repos
+                                   if isinstance(r, dict) and isinstance(r.get("repo"), str)]
+                    index = {
+                        "fetched_at": _utcnow_iso(),
+                        "repos": valid_repos,
+                        "user_added": [],
+                    }
+                    # Preserve user_added from existing cache
+                    if cache_path.is_file():
+                        try:
+                            old = json.loads(cache_path.read_text(encoding="utf-8"))
+                            index["user_added"] = old.get("user_added", [])
+                        except (json.JSONDecodeError, OSError):
+                            pass
+                    cache_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+                    return index
+            except Exception:
+                # Fallback to local cache
+                if cache_path.is_file():
+                    try:
+                        return json.loads(cache_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        pass
+                return {"fetched_at": "", "repos": [], "user_added": []}
+
+        def _all_repos(index: dict) -> list:
+            """Combine repos and user_added into a single list."""
+            repos = list(index.get("repos", []))
+            for ua in index.get("user_added", []):
+                if not any(r.get("repo") == ua.get("repo") for r in repos):
+                    repos.append(ua)
+            return repos
+
+        if hub_command == "browse":
+            self.output.header("Hub - Browse")
+            index = _load_index()
+            repos = _all_repos(index)
+            if not repos:
+                self.output.info("  No repos in hub index. Try 'hub refresh' or 'hub add owner/repo'.")
+                return ExitCode.OK
+
+            # Cross-reference with installed items for provenance markers
+            installed_sources: Dict[str, int] = {}
+            for f in self._collect_searchable_files():
+                src = f["metadata"].get("installed_from", "")
+                if src:
+                    installed_sources[src.lower()] = installed_sources.get(src.lower(), 0) + 1
+
+            if self.output.json_mode:
+                self.output.set_json("repos", repos)
+                self.output.set_json("installed_sources", installed_sources)
+            else:
+                self.output.info(f"  {'Repo':<35} {'Description':<40} {'Status'}")
+                self.output.info(f"  {'-'*35} {'-'*40} {'-'*15}")
+                for r in repos:
+                    repo_name = r.get("repo", "unknown")
+                    desc = (r.get("description", "") or "")[:40]
+                    count = installed_sources.get(repo_name.lower(), 0)
+                    status = f"[{count} installed]" if count else ""
+                    self.output.info(f"  {repo_name:<35} {desc:<40} {status}")
+
+            return ExitCode.OK
+
+        elif hub_command == "search":
+            self.output.header("Hub - Search")
+            query_terms = getattr(self.args, "query", [])
+            if not query_terms:
+                self.output.error("Provide search terms.")
+                return ExitCode.ERROR
+
+            index = _load_index()
+            repos = _all_repos(index)
+            query_lower = " ".join(query_terms).lower()
+
+            matches = []
+            for r in repos:
+                searchable = " ".join([
+                    r.get("repo", ""),
+                    r.get("description", ""),
+                    " ".join(r.get("categories", [])),
+                ]).lower()
+                if any(term.lower() in searchable for term in query_terms):
+                    matches.append(r)
+
+            if not matches:
+                self.output.info("  No repos match the query.")
+                return ExitCode.OK
+
+            if self.output.json_mode:
+                self.output.set_json("results", matches)
+            else:
+                for r in matches:
+                    repo_name = r.get("repo", "unknown")
+                    desc = r.get("description", "")
+                    cats = ", ".join(r.get("categories", []))
+                    self.output.info(f"  {repo_name}")
+                    if desc:
+                        self.output.info(f"    {desc}")
+                    if cats:
+                        self.output.info(f"    Categories: {cats}")
+                    self.output.info("")
+
+            return ExitCode.OK
+
+        elif hub_command == "info":
+            self.output.header("Hub - Info")
+            repo_arg = getattr(self.args, "repo", None)
+            if not repo_arg:
+                self.output.error("Provide a repo in owner/name format.")
+                return ExitCode.ERROR
+
+            try:
+                owner, repo = self._parse_github_source(repo_arg)
+            except ValueError as e:
+                self.output.error(str(e))
+                return ExitCode.ERROR
+
+            self.output.info(f"  Discovering items in {owner}/{repo}...")
+            items = self._discover_remote_items(owner, repo)
+            total = sum(len(v) for v in items.values())
+
+            if total == 0:
+                self.output.warning("  No agents, skills, or rules found.")
+                return ExitCode.OK
+
+            # Cross-reference with local installs
+            installed_names: Set[str] = set()
+            for f in self._collect_searchable_files():
+                if f["metadata"].get("installed_from", "").lower() == f"{owner}/{repo}".lower():
+                    installed_names.add(f["name"])
+
+            if self.output.json_mode:
+                self.output.set_json("repo", f"{owner}/{repo}")
+                self.output.set_json("items", items)
+                self.output.set_json("installed", list(installed_names))
+            else:
+                for category, entries in items.items():
+                    if entries:
+                        self.output.info(f"\n  {category.title()} ({len(entries)}):")
+                        for item in entries:
+                            marker = " [installed]" if item["name"] in installed_names else ""
+                            size_kb = item.get("size", 0) / 1024
+                            self.output.info(f"    {item['name']}{marker} ({size_kb:.1f}KB)")
+
+            return ExitCode.OK
+
+        elif hub_command == "add":
+            self.output.header("Hub - Add")
+            repo_arg = getattr(self.args, "repo", None)
+            if not repo_arg:
+                self.output.error("Provide a repo in owner/name format.")
+                return ExitCode.ERROR
+
+            try:
+                owner, repo = self._parse_github_source(repo_arg)
+            except ValueError as e:
+                self.output.error(str(e))
+                return ExitCode.ERROR
+
+            # Validate repo exists
+            self.output.info(f"  Validating {owner}/{repo}...")
+            try:
+                contents = self._fetch_github_contents(owner, repo)
+                if not contents:
+                    self.output.error(f"  Could not access {owner}/{repo}.")
+                    return ExitCode.ERROR
+            except Exception as e:
+                self.output.error(f"  Could not access {owner}/{repo}: {e}")
+                return ExitCode.ERROR
+
+            index = _load_index()
+            repo_id = f"{owner}/{repo}"
+
+            # Check if already in index
+            all_repos = _all_repos(index)
+            if any(r.get("repo", "").lower() == repo_id.lower() for r in all_repos):
+                self.output.warning(f"  {repo_id} is already in the hub index.")
+                return ExitCode.OK
+
+            new_entry = {
+                "repo": repo_id,
+                "description": "",
+                "categories": [],
+                "stars": 0,
+                "updated": _utcnow_iso(),
+            }
+            index.setdefault("user_added", []).append(new_entry)
+            cache_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+            self.output.success(f"Added {repo_id} to hub index")
+            return ExitCode.OK
+
+        elif hub_command == "refresh":
+            self.output.header("Hub - Refresh")
+            # Fetch first, then write — don't delete cache before we have new data
+            index = _fetch_index()
+            count = len(_all_repos(index))
+            self.output.success(f"Refreshed hub index ({count} repos)")
+            return ExitCode.OK
+
+        else:
+            self.output.info("  Usage: claude-sync hub {browse|search|info|add|refresh}")
+            return ExitCode.OK
 
 
 # =============================================================================
