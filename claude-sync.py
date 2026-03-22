@@ -144,6 +144,10 @@ PORTABLE_SETTINGS_KEYS = [
     "permissions",
     "theme",
     "teammateMode",
+    "enabledPlugins",
+    "extraKnownMarketplaces",
+    "effortLevel",
+    "skipDangerousModePermissionPrompt",
 ]
 
 # settings.json keys that are machine-specific (never sync)
@@ -155,6 +159,7 @@ MACHINE_SPECIFIC_KEYS = [
 # The env block as a whole remains machine-specific — only these named keys transfer.
 RECOMMENDED_ENV_KEYS = [
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
 ]
 
 
@@ -808,6 +813,41 @@ def stamp_frontmatter(file_path: Path, timestamp: Optional[str] = None) -> None:
     file_path.write_text(new_text, encoding='utf-8')
 
 
+def _parse_md_sections(content: str) -> List[Tuple[str, str]]:
+    """Split markdown into sections by H1 headings. Returns [(heading, body), ...].
+
+    First tuple has heading="" for preamble before the first H1.
+    YAML frontmatter is stripped before parsing (not included in any section).
+    Preserves all whitespace/newlines within sections.
+    """
+    # Strip YAML frontmatter if present
+    fm_match = _FRONTMATTER_RE.match(content)
+    if fm_match:
+        text = content[fm_match.end():]
+    else:
+        text = content
+
+    sections: List[Tuple[str, str]] = []
+    lines = text.split('\n')
+    current_heading = ""
+    current_body_lines: List[str] = []
+
+    for line in lines:
+        # Match H1 headings only (not ## or ###)
+        if line.startswith('# ') and not line.startswith('## '):
+            # Save previous section
+            sections.append((current_heading, '\n'.join(current_body_lines)))
+            current_heading = line
+            current_body_lines = []
+        else:
+            current_body_lines.append(line)
+
+    # Save the last section
+    sections.append((current_heading, '\n'.join(current_body_lines)))
+
+    return sections
+
+
 class SyncEngine:
     """Push (home->repo) and pull (repo->home) with file copy."""
 
@@ -1148,6 +1188,154 @@ class SettingsMerger:
                     local_env[key] = remote_rec_env[key]
             result["env"] = local_env
         return result
+
+
+class MarkdownSectionMerger:
+    """Section-level merge for markdown files (parallel to SettingsMerger for JSON).
+
+    Operates on sections parsed by _parse_md_sections: list of (heading, body) tuples.
+    Sections are matched by heading text (exact match).
+    """
+
+    @staticmethod
+    def diff_sections(
+        local_sections: List[Tuple[str, str]],
+        remote_sections: List[Tuple[str, str]],
+    ) -> Dict[str, list]:
+        """Compare local and remote sections. Returns dict with keys:
+        unchanged, modified, added, removed.
+
+        - unchanged: [(heading, body)] — same heading and body
+        - modified: [(heading, local_body, remote_body)] — same heading, different body
+        - added: [(heading, body)] — in remote but not local
+        - removed: [(heading, body)] — in local but not remote
+        """
+        local_map: Dict[str, str] = {}
+        for heading, body in local_sections:
+            if heading:  # skip preamble for matching
+                local_map[heading] = body
+
+        remote_map: Dict[str, str] = {}
+        for heading, body in remote_sections:
+            if heading:
+                remote_map[heading] = body
+
+        unchanged: List[Tuple[str, str]] = []
+        modified: List[Tuple[str, str, str]] = []
+        added: List[Tuple[str, str]] = []
+        removed: List[Tuple[str, str]] = []
+
+        # Check local sections against remote
+        for heading, local_body in local_map.items():
+            if heading in remote_map:
+                remote_body = remote_map[heading]
+                if local_body == remote_body:
+                    unchanged.append((heading, local_body))
+                else:
+                    modified.append((heading, local_body, remote_body))
+            else:
+                removed.append((heading, local_body))
+
+        # Check for sections only in remote
+        for heading, remote_body in remote_map.items():
+            if heading not in local_map:
+                added.append((heading, remote_body))
+
+        return {
+            "unchanged": unchanged,
+            "modified": modified,
+            "added": added,
+            "removed": removed,
+        }
+
+    @staticmethod
+    def merge_sections(
+        local_sections: List[Tuple[str, str]],
+        remote_sections: List[Tuple[str, str]],
+        accept_map: Dict[str, str],
+    ) -> str:
+        """Merge sections based on accept_map decisions.
+
+        accept_map maps heading -> "remote" | "local" | "remove".
+        Preserves local ordering for existing sections.
+        Appends new accepted remote sections at end.
+        Returns merged markdown string (without frontmatter).
+        """
+        remote_map: Dict[str, str] = {}
+        for heading, body in remote_sections:
+            if heading:
+                remote_map[heading] = body
+
+        # Track which remote headings are already in local (for appending new ones)
+        local_headings: Set[str] = set()
+        merged_parts: List[str] = []
+
+        for heading, body in local_sections:
+            if not heading:
+                # Preamble — always keep
+                merged_parts.append(body)
+                continue
+            local_headings.add(heading)
+            decision = accept_map.get(heading, "local")
+            if decision == "remove":
+                continue
+            elif decision == "remote" and heading in remote_map:
+                merged_parts.append(heading + '\n' + remote_map[heading])
+            else:
+                # "local" or fallback
+                merged_parts.append(heading + '\n' + body)
+
+        # Append accepted remote-only sections at end (preserving remote ordering)
+        for heading, body in remote_sections:
+            if heading and heading not in local_headings:
+                decision = accept_map.get(heading, "local")
+                if decision == "remote":
+                    merged_parts.append(heading + '\n' + body)
+
+        return '\n'.join(merged_parts)
+
+    @staticmethod
+    def score_section_health(
+        heading: str,
+        body: str,
+        known_items: Set[str],
+    ) -> List[str]:
+        """Check a section for potential issues.
+
+        Extracts backtick-quoted names from body, checks them against known_items
+        (agent/skill names). Flags unknown references and overly long sections.
+        Returns list of warning strings (empty if healthy).
+        """
+        warnings: List[str] = []
+
+        # Extract backtick-quoted names (single backtick, not code blocks)
+        backtick_names = re.findall(r'(?<!`)`([^`\n]+)`(?!`)', body)
+        for name in backtick_names:
+            # Only check names that look like identifiers (no spaces, not paths, not code)
+            name_stripped = name.strip()
+            if (name_stripped
+                    and not ' ' in name_stripped
+                    and not '/' in name_stripped
+                    and not '=' in name_stripped
+                    and not '(' in name_stripped
+                    and not name_stripped.startswith('-')
+                    and not name_stripped.startswith('.')
+                    and len(name_stripped) > 2
+                    and name_stripped == name_stripped.lower().replace('-', '_').replace('_', name_stripped)):
+                # Looks like a potential agent/skill reference — but only flag
+                # if known_items is non-empty (we have something to check against)
+                if known_items and name_stripped not in known_items:
+                    # Only flag names that look like agent/skill references
+                    # (kebab-case or snake_case identifiers)
+                    if re.match(r'^[a-z][a-z0-9_-]+$', name_stripped):
+                        warnings.append(f"References `{name_stripped}` which doesn't exist")
+
+        # Check section length
+        body_lines = body.split('\n')
+        if len(body_lines) > 200:
+            warnings.append(f"Section is very long ({len(body_lines)} lines), consider splitting")
+
+        return warnings
 
 
 # =============================================================================
@@ -4146,6 +4334,9 @@ class ClaudeSync:
         backup_mgr.create_backup(self.paths.repo_claude, "pre-push")
         self.output.detail("Created pre-push backup")
 
+        # Section-level merge for CLAUDE.md
+        claude_md_count = self._merge_claude_md("push", force, yes, theirs, ours, diff_result)
+
         # Perform push
         engine = SyncEngine(self.paths, self.output)
         count = engine.push(diff_result)
@@ -4316,6 +4507,9 @@ class ClaudeSync:
         backup_mgr = BackupManager()
         backup_path = backup_mgr.create_backup(self.paths.home_claude, "pre-pull")
         self.output.detail(f"Created pre-pull backup: {backup_path.name}")
+
+        # Section-level merge for CLAUDE.md
+        claude_md_count = self._merge_claude_md("pull", force, yes, theirs, ours, diff_result)
 
         # Perform pull
         engine = SyncEngine(self.paths, self.output)
@@ -5580,6 +5774,222 @@ class ClaudeSync:
                         key, _, val = line.partition(":")
                         meta[key.strip()] = val.strip().strip('"').strip("'")
         return meta
+
+    def _merge_claude_md(self, direction: str, force: bool, yes: bool,
+                          theirs: bool, ours: bool, diff_result) -> int:
+        """Section-level merge for CLAUDE.md during pull/push. Returns count of files handled.
+
+        Instead of wholesale file copy, this merges CLAUDE.md at the section level
+        (H1 headings), letting users accept/reject individual sections.
+        """
+        # Check if CLAUDE.md appears in the diff
+        claude_md_path = "CLAUDE.md"
+        claude_md_change = None
+        change_list_name = None
+        for change in diff_result.added:
+            if change.path == claude_md_path:
+                claude_md_change = change
+                change_list_name = "added"
+                break
+        if not claude_md_change:
+            for change in diff_result.modified:
+                if change.path == claude_md_path:
+                    claude_md_change = change
+                    change_list_name = "modified"
+                    break
+        if not claude_md_change:
+            return 0
+
+        # Force mode: let wholesale copy proceed
+        if force:
+            return 0
+
+        # Non-interactive: let wholesale copy proceed
+        if not self.output.is_tty:
+            return 0
+
+        # Determine file paths based on direction
+        if direction == "pull":
+            local_path = self.paths.home_claude / claude_md_path
+            remote_path = self.paths.repo_claude / claude_md_path
+        else:  # push
+            local_path = self.paths.home_claude / claude_md_path
+            remote_path = self.paths.repo_claude / claude_md_path
+
+        # Read both files — if either can't be read, bail out
+        try:
+            local_content = local_path.read_text(encoding='utf-8') if local_path.exists() else ""
+            remote_content = remote_path.read_text(encoding='utf-8') if remote_path.exists() else ""
+        except OSError:
+            return 0
+
+        # Parse sections
+        local_sections = _parse_md_sections(local_content)
+        remote_sections = _parse_md_sections(remote_content)
+
+        # Diff sections
+        section_diff = MarkdownSectionMerger.diff_sections(local_sections, remote_sections)
+
+        # If no section-level differences, nothing to do
+        if (not section_diff["modified"] and not section_diff["added"]
+                and not section_diff["removed"]):
+            return 0
+
+        # Collect known agent/skill names for health scoring
+        known_items: Set[str] = set()
+        try:
+            searchable = self._collect_searchable_files()
+            for item in searchable:
+                name = item.get("name", "")
+                if name:
+                    known_items.add(name)
+        except Exception:
+            pass  # Health scoring is best-effort
+
+        # Build accept_map based on flags
+        accept_map: Dict[str, str] = {}
+
+        # Auto-accept modes (non-interactive resolution)
+        if yes or (direction == "pull" and theirs) or (direction == "push" and ours):
+            # Accept all remote sections
+            for heading, _lb, _rb in section_diff["modified"]:
+                accept_map[heading] = "remote"
+            for heading, _body in section_diff["added"]:
+                accept_map[heading] = "remote"
+            for heading, _body in section_diff["removed"]:
+                accept_map[heading] = "remove"
+        elif (direction == "pull" and ours) or (direction == "push" and theirs):
+            # Keep all local — remove CLAUDE.md from diff so engine skips it
+            if change_list_name == "added":
+                diff_result.added = [c for c in diff_result.added if c.path != claude_md_path]
+            elif change_list_name == "modified":
+                diff_result.modified = [c for c in diff_result.modified if c.path != claude_md_path]
+            return 1
+        else:
+            # Interactive review
+            self.output.header("CLAUDE.md Section Merge")
+            self.output.info(f"  {len(section_diff['unchanged'])} unchanged section(s)")
+            if section_diff["modified"]:
+                self.output.info(f"  {len(section_diff['modified'])} modified section(s):")
+                for heading, _lb, _rb in section_diff["modified"]:
+                    warnings = MarkdownSectionMerger.score_section_health(heading, _rb, known_items)
+                    warn_str = f" (!) {'; '.join(warnings)}" if warnings else ""
+                    self.output.detail(f"    ~ {heading}{warn_str}")
+            if section_diff["added"]:
+                self.output.info(f"  {len(section_diff['added'])} new section(s) from remote:")
+                for heading, _body in section_diff["added"]:
+                    warnings = MarkdownSectionMerger.score_section_health(heading, _body, known_items)
+                    warn_str = f" (!) {'; '.join(warnings)}" if warnings else ""
+                    self.output.detail(f"    + {heading}{warn_str}")
+            if section_diff["removed"]:
+                self.output.info(f"  {len(section_diff['removed'])} section(s) only in local:")
+                for heading, _body in section_diff["removed"]:
+                    self.output.detail(f"    - {heading}")
+
+            try:
+                choice = input("\n  [a]ccept all remote / [k]eep all local / [r]eview each? [r] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+
+            if choice == 'a':
+                for heading, _lb, _rb in section_diff["modified"]:
+                    accept_map[heading] = "remote"
+                for heading, _body in section_diff["added"]:
+                    accept_map[heading] = "remote"
+                for heading, _body in section_diff["removed"]:
+                    accept_map[heading] = "remove"
+            elif choice == 'k':
+                # Keep all local — remove CLAUDE.md from diff
+                if change_list_name == "added":
+                    diff_result.added = [c for c in diff_result.added if c.path != claude_md_path]
+                elif change_list_name == "modified":
+                    diff_result.modified = [c for c in diff_result.modified if c.path != claude_md_path]
+                return 1
+            else:
+                # Review each section
+                for heading, local_body, remote_body in section_diff["modified"]:
+                    self.output.info(f"\n  Section: {heading}")
+                    # Show diff preview (first 15 lines)
+                    local_lines = local_body.strip().splitlines()[:15]
+                    remote_lines = remote_body.strip().splitlines()[:15]
+                    diff_lines = list(difflib.unified_diff(
+                        local_lines, remote_lines,
+                        fromfile="local", tofile="remote", lineterm=""
+                    ))
+                    for dl in diff_lines[:20]:
+                        self.output.detail(f"    {dl}")
+                    if len(diff_lines) > 20:
+                        self.output.detail(f"    ... ({len(diff_lines) - 20} more diff lines)")
+                    # Health warnings
+                    warnings = MarkdownSectionMerger.score_section_health(heading, remote_body, known_items)
+                    for w in warnings:
+                        self.output.warning(f"    {w}")
+                    try:
+                        sec_choice = input("  [a]ccept remote / [k]eep local? [a] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        sec_choice = 'k'
+                    accept_map[heading] = "remote" if sec_choice != 'k' else "local"
+
+                for heading, body in section_diff["added"]:
+                    self.output.info(f"\n  New section: {heading}")
+                    preview_lines = body.strip().splitlines()[:15]
+                    for pl in preview_lines:
+                        self.output.detail(f"    {pl}")
+                    if len(body.strip().splitlines()) > 15:
+                        self.output.detail(f"    ... ({len(body.strip().splitlines()) - 15} more lines)")
+                    warnings = MarkdownSectionMerger.score_section_health(heading, body, known_items)
+                    for w in warnings:
+                        self.output.warning(f"    {w}")
+                    try:
+                        sec_choice = input("  [a]ccept / [s]kip? [a] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        sec_choice = 's'
+                    accept_map[heading] = "remote" if sec_choice != 's' else "local"
+
+                for heading, body in section_diff["removed"]:
+                    self.output.info(f"\n  Local-only section: {heading}")
+                    try:
+                        sec_choice = input("  [k]eep / [r]emove? [k] ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        sec_choice = 'k'
+                    accept_map[heading] = "remove" if sec_choice == 'r' else "local"
+
+        # Merge sections
+        merged_body = MarkdownSectionMerger.merge_sections(
+            local_sections, remote_sections, accept_map
+        )
+
+        # Preserve frontmatter from the LOCAL file (it has sync metadata)
+        local_fm_match = _FRONTMATTER_RE.match(local_content)
+        if local_fm_match:
+            merged_content = local_content[:local_fm_match.end()] + merged_body
+        else:
+            merged_content = merged_body
+
+        # Write merged content to the appropriate destination
+        try:
+            if direction == "pull":
+                dest_path = self.paths.home_claude / claude_md_path
+            else:
+                dest_path = self.paths.repo_claude / claude_md_path
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(merged_content, encoding='utf-8')
+        except OSError as e:
+            self.output.warning(f"  Failed to write merged CLAUDE.md: {e}")
+            return 0
+
+        # Remove CLAUDE.md from diff so engine.pull/push skips it
+        if change_list_name == "added":
+            diff_result.added = [c for c in diff_result.added if c.path != claude_md_path]
+        elif change_list_name == "modified":
+            diff_result.modified = [c for c in diff_result.modified if c.path != claude_md_path]
+
+        self.output.success("  Merged CLAUDE.md sections")
+        return 1
 
     def _filter_derived_artifacts(self, diff_result: DiffResult) -> bool:
         """Remove derived artifacts (skill-rules.json) from diff when atomized triggers exist.
