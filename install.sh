@@ -19,12 +19,23 @@ if brew tap | grep -q "rydersd/tools"; then
     brew untap rydersd/tools 2>/dev/null || true
 fi
 
-# Tap and install
-brew tap rydersd/claude-sync https://github.com/rydersd/claude-sync 2>/dev/null || true
-brew install claude-sync 2>/dev/null || brew upgrade claude-sync
+# Tap repo
+if ! brew tap | grep -q "rydersd/claude-sync"; then
+    echo "Adding rydersd/claude-sync tap..."
+    brew tap rydersd/claude-sync https://github.com/rydersd/claude-sync
+fi
+
+# Install or upgrade
+if brew list claude-sync &>/dev/null; then
+    echo "Upgrading claude-sync..."
+    brew upgrade claude-sync
+else
+    echo "Installing claude-sync..."
+    brew install claude-sync
+fi
 
 echo ""
-echo "Installed: $(claude-sync --help 2>&1 | head -1)"
+echo "Installed: $(which claude-sync)"
 echo ""
 echo "Quick start:"
 echo "  cd your-git-repo"
