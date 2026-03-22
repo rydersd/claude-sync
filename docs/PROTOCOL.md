@@ -18,6 +18,8 @@
 7. [Security Considerations](#7-security-considerations)
 8. [Compatibility](#8-compatibility)
 9. [Appendix: Quick Reference](#9-appendix-quick-reference)
+10. [Protocol v2 Extensions](#10-protocol-v2-extensions)
+11. [Tracker Protocol](#11-tracker-protocol)
 
 ---
 
@@ -941,8 +943,61 @@ Implementations MUST maintain an explicit allowlist of portable keys. Any key no
 - `attribution`
 - `permissions`
 - `theme`
+- `teammateMode` — cowork/agent teams display mode (`"in-process"`, `"tmux"`, `"auto"`)
 
 This list may be extended in future protocol versions.
+
+### 6.5 Recommended Environment Variables
+
+The `env` block in `settings.json` is machine-specific and NEVER synced as a whole. However, specific named keys within `env` can be promoted to sync via the **recommended env keys** mechanism.
+
+**How it works:**
+
+1. **Push (sender side):** After extracting portable keys, also extract any env keys that match the recommended list. Include them under an `"env"` key in the portable output (containing ONLY the recommended keys, not the full env block).
+
+2. **Pull (receiver side):** After deep-merging portable keys, merge recommended env keys into the local `env` dict individually. Local-only env keys are preserved untouched.
+
+**Recommended env key list:**
+
+- `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` — enables agent teams / cowork feature [EXPERIMENTAL → STANDARD]
+
+**Example:**
+
+```
+Push:
+  local env: { "PATH": "/usr/bin", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+  portable output includes: { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
+
+Pull:
+  local env: { "PATH": "/usr/bin" }
+  remote env (from portable): { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+  result env: { "PATH": "/usr/bin", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" }
+```
+
+### 6.6 Capability Manifest
+
+During push, implementations SHOULD generate a `.claude-sync-capabilities.json` file alongside the file manifest. This is a structured, machine-readable description of the synced configuration's capabilities.
+
+**Purpose:** Enables GUI tools, MCP servers, peer comparison, and selective sync by providing a semantic layer on top of raw file hashes.
+
+**Location:** `repo/claude/.claude-sync-capabilities.json`
+
+**Schema:**
+
+```json
+{
+  "version": "1.3.0",
+  "generated": "2026-03-22T14:30:00Z",
+  "source": { "hostname": "macbook-pro", "platform": "darwin" },
+  "agents": { "<name>": { "description": "...", "model": "..." } },
+  "skills": { "<name>": { "description": "...", "triggers": ["..."] } },
+  "plugins": { "<name>": { "enabled": true } },
+  "rules": ["<slug>", "..."],
+  "worksets": ["<name>", "..."],
+  "settings": { "teammateMode": "tmux", "cowork_enabled": true },
+  "counts": { "agents": 47, "skills": 23, "plugins": 3, "rules": 8 }
+}
+```
 
 ---
 
@@ -1118,14 +1173,436 @@ Wire bytes (hex):
 
 - `CLAUDE.md`
 - `settings.json` (portable keys only, per Section 6)
-- `rules/*.md`
+- `keybindings.json` (synced as whole file, no partial merge)
+- `agents/**/*`
 - `skills/**/*`
+- `rules/*.md`
 - `hooks/**/*` (script files referenced by settings.json hooks)
+- `scripts/**/*`
+- `memory/**/*`
+- `worksets/**/*` (excluding state files, see below)
+- `plugins/**/*` (installed Claude Code plugins)
+- `.claude-sync-capabilities.json` (capability manifest, per Section 6.6)
 
 **Not synced:**
 
-- `.credentials`
+- `.env`, `.credentials`
+- `mcp_config.json` (machine-specific MCP server config)
 - `projects/` (machine-specific project paths)
-- `cache/` (ephemeral data)
-- `statsig/` (telemetry)
-- Any file starting with `.` (hidden files)
+- `teams/` (cowork runtime state — active team configs)
+- `tasks/` (cowork runtime state — active task lists)
+- `cache/`, `state/`, `plans/`, `downloads/` (ephemeral data)
+- `telemetry/`, `statsig/`, `debug/` (telemetry and diagnostics)
+- `session-env/`, `shell-snapshots/`, `paste-cache/`, `file-history/`
+- `.workset-vault/`, `worksets/_state.json`, `worksets/_affinity.json` (machine-local workset state)
+- `todos/`, `history.jsonl`, `stats-cache.json`
+
+---
+
+## 10. Protocol v2 Extensions
+
+Protocol v2 adds live auto-sync capabilities on top of the existing v1 message set. V2 is backward compatible — v1 peers continue to work as before (connect-per-sync). V2 features are opt-in via capability negotiation.
+
+### 10.1 Capability Negotiation
+
+The `hello` message gains an optional `capabilities` array:
+
+```json
+{
+  "type": "hello",
+  "device_id": "...",
+  "name": "...",
+  "protocol_version": 1,
+  "fingerprint": "...",
+  "platform": "macos",
+  "file_count": 12,
+  "capabilities": ["auto_sync", "persistent"]
+}
+```
+
+| Capability | Description |
+|---|---|
+| `auto_sync` | Peer supports `file_changed` / `file_changed_ack` messages |
+| `persistent` | Peer supports persistent connections with `keepalive` |
+
+**Rules:**
+- `capabilities` is optional. Absent = v1-only peer.
+- Unknown capabilities MUST be ignored (forward compatibility).
+- A peer MUST NOT send v2 messages unless the remote peer advertised the corresponding capability.
+
+### 10.2 Persistent Connections
+
+V1 connections are transient: open → exchange → close. V2 peers with the `persistent` capability keep connections alive.
+
+**Keepalive:**
+- Send `keepalive` every **15 seconds** on idle connections.
+- If no message received for **45 seconds**, mark connection as dead.
+- Dead connections trigger auto-reconnect with exponential backoff: 2s → 4s → 8s → 16s → 30s (cap).
+
+**Connection lifecycle (v2):**
+1. TCP connect + hello exchange (same as v1).
+2. If both peers have `persistent` capability, connection stays open.
+3. Either side may send `subscribe` to opt in to real-time file change notifications.
+4. Keepalive messages flow on idle connections.
+5. Sync operations (manifest, push, pull) can be performed on the persistent connection.
+6. Either side can close at any time; the other auto-reconnects.
+
+### 10.3 New Message Types
+
+#### `subscribe`
+
+Opt-in to real-time file change notifications. Sent after hello exchange.
+
+```json
+{
+  "type": "subscribe",
+  "paths": ["*"]
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Always `"subscribe"` |
+| `paths` | array | Yes | Glob patterns of paths to subscribe to. `["*"]` = all syncable files. |
+
+#### `subscribe_ack`
+
+Acknowledgment of a subscription request.
+
+```json
+{
+  "type": "subscribe_ack",
+  "accepted": true,
+  "subscribed_paths": ["*"]
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Always `"subscribe_ack"` |
+| `accepted` | boolean | Yes | Whether the subscription was accepted |
+| `subscribed_paths` | array | Yes | Paths the peer agreed to notify on |
+
+#### `file_changed`
+
+Push a changed file to subscribed peers. Combines notification + payload.
+
+```json
+{
+  "type": "file_changed",
+  "path": "rules/git-commits.md",
+  "change": "modified",
+  "sha256": "a7ffc6f8bf1ed...",
+  "size": 892,
+  "mtime_epoch": 1707350400,
+  "change_epoch_ms": 1707350400123,
+  "previous_sha256": "oldsha256hex...",
+  "content_base64": "IyBHaXQgQ29tbWl0...",
+  "executable": false
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Always `"file_changed"` |
+| `path` | string | Yes | Relative POSIX path of the changed file |
+| `change` | string | Yes | One of: `"modified"`, `"created"`, `"deleted"` |
+| `sha256` | string | Conditional | SHA-256 hex digest. Omit for `"deleted"`. |
+| `size` | integer | Conditional | File size in bytes. Omit for `"deleted"`. |
+| `mtime_epoch` | integer | Yes | Last modification time as Unix epoch seconds |
+| `change_epoch_ms` | integer | Yes | Millisecond-precision timestamp of the change event |
+| `previous_sha256` | string | No | Expected current hash on the receiver (for conflict detection) |
+| `content_base64` | string | Conditional | Base64-encoded file content. `null` for files >1MB (receiver pulls via `sync_request`). Omit for `"deleted"`. |
+| `executable` | boolean | Conditional | Whether file has executable bit. Omit for `"deleted"`. |
+
+**Large file handling:** Files >1MB set `content_base64` to `null`. The receiver detects this and pulls the full file via a standard `sync_request`/`file` exchange.
+
+#### `file_changed_ack`
+
+Acknowledge receipt of a `file_changed` notification.
+
+```json
+{
+  "type": "file_changed_ack",
+  "path": "rules/git-commits.md",
+  "accepted": true,
+  "conflict": false
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Always `"file_changed_ack"` |
+| `path` | string | Yes | Path of the acknowledged file |
+| `accepted` | boolean | Yes | Whether the change was applied |
+| `conflict` | boolean | Yes | Whether a conflict was detected and resolved |
+
+#### `keepalive`
+
+Sent every 15 seconds on idle persistent connections.
+
+```json
+{
+  "type": "keepalive",
+  "timestamp": 1707350400
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Always `"keepalive"` |
+| `timestamp` | integer | Yes | Unix epoch seconds when sent |
+
+No response is expected. If no message (of any type) is received for 45 seconds, the connection is considered dead.
+
+### 10.4 Conflict Resolution
+
+When a `file_changed` arrives, the receiver applies this algorithm:
+
+1. **No conflict**: Local hash matches `previous_sha256` → accept the change.
+2. **Concurrent edit** (local hash does NOT match `previous_sha256`):
+   a. Compare `change_epoch_ms` — **newer timestamp wins**.
+   b. If timestamps within 1 second — **lower `device_id` (lexicographic)** wins (deterministic tiebreaker).
+   c. For files under `memory/` — **append-merge**: concatenate both versions separated by `\n---\n` (memory files are append-only).
+3. Send `file_changed_ack` with `conflict: true` if a conflict was detected and resolved.
+
+### 10.5 File System Watching
+
+V2 peers replace polling with OS-native file system event APIs:
+
+| Platform | API | Watch Target |
+|---|---|---|
+| macOS | FSEvents (`kFSEventStreamCreateFlagFileEvents`) | `~/.claude/` recursive |
+| Linux | inotify (via `notify` crate) | `~/.claude/` recursive |
+| Windows | ReadDirectoryChangesW (via `notify` crate) | `%USERPROFILE%\.claude\` recursive |
+
+**Debouncing:**
+- Accumulate changed paths in a set.
+- First event starts a **500ms** timer; subsequent events reset it.
+- At **2 seconds**, force-flush regardless (prevents infinite deferral during burst writes).
+- Only rehash changed files (not full scan).
+
+**Flow:** File change detected → debounce → rehash changed files → update fingerprint → update mDNS TXT → broadcast `file_changed` to all subscribed peers.
+
+### 10.6 V2 Message Quick Reference
+
+| Message | Direction | Capability Required | Purpose |
+|---|---|---|---|
+| `subscribe` | Either | `auto_sync` | Opt-in to file change notifications |
+| `subscribe_ack` | Response | `auto_sync` | Confirm subscription |
+| `file_changed` | Sender | `auto_sync` | Push changed file to subscriber |
+| `file_changed_ack` | Receiver | `auto_sync` | Acknowledge file change |
+| `keepalive` | Either | `persistent` | Keep connection alive |
+
+---
+
+## 11. Tracker Protocol
+
+The tracker enables cross-network peering. Inspired by Hotline (1997), where servers registered with tracker directories and clients found them through the tracker.
+
+**Model:**
+- **LAN** → mDNS auto-discovery (unchanged from v1)
+- **WAN** → Peers register with a tracker; peers find each other through it
+- **Connection** → Try direct TCP first; relay through tracker if NAT blocks it
+
+### 11.1 Tracker Transport
+
+Peers connect to the tracker via **WebSocket over TLS** (`wss://`). All tracker messages are JSON frames on the WebSocket.
+
+### 11.2 Tracker Message Types
+
+#### `tracker_register`
+
+Peer registers its presence with the tracker.
+
+```json
+{
+  "type": "tracker_register",
+  "device_id": "a1b2c3d4-...",
+  "name": "Ryders-MacBook-Pro",
+  "platform": "macos",
+  "protocol_version": 1,
+  "capabilities": ["auto_sync", "persistent"],
+  "listen_port": 49152,
+  "fingerprint": "3a7f2b1c9d4e8f06",
+  "file_count": 12
+}
+```
+
+#### `tracker_register_ack`
+
+Tracker confirms registration and reports the peer's public address.
+
+```json
+{
+  "type": "tracker_register_ack",
+  "success": true,
+  "public_addr": "203.0.113.42:49152",
+  "tracker_time": 1707350400
+}
+```
+
+#### `tracker_heartbeat`
+
+Sent by peers every **30 seconds**. No heartbeat for **90 seconds** = evicted.
+
+```json
+{
+  "type": "tracker_heartbeat",
+  "device_id": "a1b2c3d4-...",
+  "fingerprint": "3a7f2b1c9d4e8f06",
+  "file_count": 12
+}
+```
+
+#### `tracker_peer_list_request` / `tracker_peer_list_response`
+
+Request/response for the list of other registered peers.
+
+```json
+{
+  "type": "tracker_peer_list_request"
+}
+```
+
+```json
+{
+  "type": "tracker_peer_list_response",
+  "peers": [
+    {
+      "device_id": "f9e8d7c6-...",
+      "name": "Office-Desktop",
+      "platform": "windows",
+      "public_addr": "198.51.100.17:51234",
+      "fingerprint": "7c1e4a9b3d2f0856",
+      "file_count": 8,
+      "capabilities": ["auto_sync", "persistent"],
+      "last_seen": 1707350380
+    }
+  ]
+}
+```
+
+#### `tracker_peer_online` / `tracker_peer_offline`
+
+Real-time notifications when peers join or leave.
+
+```json
+{
+  "type": "tracker_peer_online",
+  "device_id": "f9e8d7c6-...",
+  "name": "Office-Desktop",
+  "platform": "windows",
+  "public_addr": "198.51.100.17:51234"
+}
+```
+
+```json
+{
+  "type": "tracker_peer_offline",
+  "device_id": "f9e8d7c6-..."
+}
+```
+
+#### `tracker_relay_request` / `tracker_relay_ack` / `tracker_relay_data`
+
+When direct connection fails (NAT), peers relay traffic through the tracker.
+
+```json
+{
+  "type": "tracker_relay_request",
+  "target_device_id": "f9e8d7c6-...",
+  "source_device_id": "a1b2c3d4-..."
+}
+```
+
+```json
+{
+  "type": "tracker_relay_ack",
+  "accepted": true,
+  "relay_id": "relay-uuid-..."
+}
+```
+
+```json
+{
+  "type": "tracker_relay_data",
+  "relay_id": "relay-uuid-...",
+  "from_device_id": "a1b2c3d4-...",
+  "payload_base64": "..."
+}
+```
+
+**End-to-end encryption:** All `tracker_relay_data` payloads are encrypted with the paired device's public key. The tracker cannot read relay traffic.
+
+### 11.3 WAN Connection Flow
+
+```
+Peer A → registers with Tracker (WebSocket/TLS)
+Peer B → registers with Tracker (WebSocket/TLS)
+Peer A requests peer list → sees Peer B
+Peer A tries direct TCP to Peer B's public_addr (5s timeout)
+  ✓ Direct works → use it (favorable NAT / port forwarding)
+  ✗ Direct fails → request relay through Tracker
+    Tracker notifies Peer B → both relay through Tracker
+    All sync messages wrapped in tracker_relay_data (end-to-end encrypted)
+```
+
+### 11.4 Tracker Server REST API
+
+For monitoring and health checks:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/health` | GET | Server health status |
+| `/peers` | GET | List of registered peers (admin) |
+| `/stats` | GET | Connection and relay statistics |
+
+### 11.5 TLS and Device Pairing
+
+All WAN traffic is encrypted. See Section 7.3 for the pairing flow.
+
+**Certificate generation (first launch):**
+- Ed25519 keypair + self-signed X.509 certificate (10-year validity)
+- Stored at platform-specific paths:
+  - macOS: `~/Library/Application Support/claude-sync/device.{key,cert}`
+  - Windows: `%APPDATA%\claude-sync\device.{key,cert}`
+
+**Pairing flow:**
+1. Device A initiates pairing with Device B.
+2. Device B displays a 6-digit confirmation code.
+3. User enters the code on Device A.
+4. Both devices exchange and persist certificate fingerprints (SHA-256 of DER).
+5. All future WAN connections use mutual TLS with pinned certificates.
+6. Unpaired devices are rejected at TLS handshake.
+
+**LAN behavior:** Configurable via `allow_unpaired_lan` setting (default: `true` for backward compatibility).
+
+### 11.6 Configuration
+
+Peer-side tracker configuration stored in `~/.claude/sync-config.json`:
+
+```json
+{
+  "trackers": [
+    { "url": "wss://tracker.example.com:8443", "name": "My Tracker", "enabled": true }
+  ],
+  "auto_sync": { "enabled": true, "debounce_ms": 500 },
+  "security": { "require_pairing": true, "allow_unpaired_lan": true }
+}
+```
+
+### 11.7 Tracker Message Quick Reference
+
+| Message | Direction | Purpose |
+|---|---|---|
+| `tracker_register` | Peer → Tracker | Register presence |
+| `tracker_register_ack` | Tracker → Peer | Confirm + report public IP |
+| `tracker_heartbeat` | Peer → Tracker | I'm alive (every 30s) |
+| `tracker_peer_list_request` | Peer → Tracker | Request peer list |
+| `tracker_peer_list_response` | Tracker → Peer | Return peer list |
+| `tracker_peer_online` | Tracker → Peer | Peer came online |
+| `tracker_peer_offline` | Tracker → Peer | Peer went offline |
+| `tracker_relay_request` | Peer → Tracker | Request relay channel |
+| `tracker_relay_ack` | Tracker → Peer | Confirm relay |
+| `tracker_relay_data` | Both (via Tracker) | Encrypted relay payload |

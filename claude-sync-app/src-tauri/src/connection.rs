@@ -7,29 +7,40 @@
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{Duration, Instant};
 
 use crate::protocol::SyncMessage;
 
-/// Maximum message size: 50 MB. Prevents OOM from malformed length prefixes.
-const MAX_MESSAGE_SIZE: u32 = 50 * 1024 * 1024;
+/// Maximum message size: 16 MB per PROTOCOL.md Section 3.5.
+const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 /// A framed TCP connection that sends and receives SyncMessage values
 /// with 4-byte big-endian length-prefixed JSON encoding.
+/// Tracks the time of the last received message for keepalive/liveness checks.
 pub struct FramedConnection {
     stream: TcpStream,
+    /// Monotonic instant of the last successfully received message.
+    /// Used by persistent connections to detect dead peers.
+    last_message_received: Instant,
 }
 
 impl FramedConnection {
     /// Create a new FramedConnection wrapping a TCP stream.
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            last_message_received: Instant::now(),
+        }
     }
 
     /// Connect to a remote peer at the given address.
     /// Returns a FramedConnection ready for message exchange.
     pub async fn connect(address: &str) -> Result<Self, io::Error> {
         let stream = TcpStream::connect(address).await?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            last_message_received: Instant::now(),
+        })
     }
 
     /// Send a SyncMessage to the remote peer.
@@ -95,7 +106,31 @@ impl FramedConnection {
         let message: SyncMessage = serde_json::from_slice(&body_buf)
             .map_err(|e| ConnectionError::Deserialization(e.to_string()))?;
 
+        // Update liveness tracker on every successful receive
+        self.last_message_received = Instant::now();
+
         Ok(message)
+    }
+
+    /// Send a keepalive message with the current Unix timestamp.
+    /// Persistent connections should call this every 15 seconds.
+    pub async fn send_keepalive(&mut self) -> Result<(), ConnectionError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        self.send(&SyncMessage::Keepalive { timestamp: now }).await
+    }
+
+    /// Check if the connection appears alive based on the last received message.
+    /// Returns false if no message has been received within `timeout`.
+    pub fn is_alive(&self, timeout: Duration) -> bool {
+        self.last_message_received.elapsed() < timeout
+    }
+
+    /// Get the monotonic instant of the last successfully received message.
+    pub fn last_message_time(&self) -> Instant {
+        self.last_message_received
     }
 
     /// Shutdown the connection gracefully.

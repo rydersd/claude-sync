@@ -1,6 +1,7 @@
 // ==========================================================================
 // Config scanner - walks ~/.claude/ and computes file hashes
 // Matches the same sync paths and exclusions as the Python claude-sync.py tool.
+// Fingerprint algorithm per PROTOCOL.md Section 2.3.
 // ==========================================================================
 
 use sha2::{Digest, Sha256};
@@ -8,11 +9,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use walkdir::WalkDir;
 
-use crate::protocol::FileEntry;
+use crate::protocol::{FileEntry, ManifestFileEntry};
 
 /// Paths to sync (relative to ~/.claude/). Matches Python tool's SYNC_PATHS.
+/// memory/ included so the entire "second brain" ecosystem syncs across machines
+/// (voice profiles, story banks, feedback, project context, etc.)
 const SYNC_PATHS: &[&str] = &[
     "CLAUDE.md",
     "agents/",
@@ -20,6 +24,10 @@ const SYNC_PATHS: &[&str] = &[
     "rules/",
     "hooks/",
     "scripts/",
+    "memory/",
+    "worksets/",
+    "plugins/",
+    "keybindings.json",
 ];
 
 /// Paths that are always excluded from syncing. Matches Python tool's EXCLUDE_PATHS.
@@ -36,12 +44,16 @@ const EXCLUDE_PATHS: &[&str] = &[
     "state/",
     "plans/",
     "downloads/",
-    "plugins/",
     "shell-snapshots/",
     "paste-cache/",
     "file-history/",
     "debug/",
     "statsig/",
+    ".workset-vault/",
+    "worksets/_state.json",
+    "worksets/_affinity.json",
+    "teams/",
+    "tasks/",
 ];
 
 /// Patterns for files/directories to skip during tree walking.
@@ -61,7 +73,7 @@ pub fn claude_home_dir() -> PathBuf {
         .join(".claude")
 }
 
-/// Scan the ~/.claude/ directory and return a map of relative_path -> SHA-256 hash
+/// Scan the ~/.claude/ directory and return a map of relative_path -> FileEntry
 /// for all syncable files.
 pub fn scan_config_dir() -> HashMap<String, FileEntry> {
     let base_dir = claude_home_dir();
@@ -109,9 +121,20 @@ pub fn scan_directory(base_dir: &Path) -> HashMap<String, FileEntry> {
             Err(_) => continue,
         };
 
-        // Get file size
-        let size = fs::metadata(abs_path)
-            .map(|m| m.len())
+        // Get file metadata
+        let metadata = match fs::metadata(abs_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let size = metadata.len();
+
+        // Get modification time as Unix epoch seconds
+        let mtime_epoch = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
         // Check executable bit (Unix-only)
@@ -127,6 +150,7 @@ pub fn scan_directory(base_dir: &Path) -> HashMap<String, FileEntry> {
                 sha256: hash,
                 size,
                 executable,
+                mtime_epoch,
             },
         );
     }
@@ -134,7 +158,20 @@ pub fn scan_directory(base_dir: &Path) -> HashMap<String, FileEntry> {
     result
 }
 
-/// Compute the SHA-256 hash of a file, reading in 64KB chunks.
+/// Convert internal FileEntry map to ManifestFileEntry list for the wire protocol.
+pub fn to_manifest_entries(files: &HashMap<String, FileEntry>) -> Vec<ManifestFileEntry> {
+    files
+        .values()
+        .map(|f| ManifestFileEntry {
+            path: f.path.clone(),
+            sha256: f.sha256.clone(),
+            size: f.size,
+            mtime_epoch: f.mtime_epoch,
+        })
+        .collect()
+}
+
+/// Compute the SHA-256 hash of a file, reading in one pass.
 /// Returns the hex-encoded hash string.
 pub fn hash_file(path: &Path) -> Result<String, std::io::Error> {
     let data = fs::read(path)?;
@@ -144,27 +181,38 @@ pub fn hash_file(path: &Path) -> Result<String, std::io::Error> {
     Ok(hex_encode(&result))
 }
 
-/// Compute a combined fingerprint hash from a set of file entries.
-/// This creates a deterministic fingerprint by sorting all file hashes
-/// alphabetically by path and hashing the concatenation.
+/// Compute a combined fingerprint hash from a set of file entries
+/// per PROTOCOL.md Section 2.3.
+///
+/// Algorithm:
+/// 1. Create "path:sha256" strings for each file
+/// 2. Sort lexicographically
+/// 3. Join with "\n" (no trailing newline)
+/// 4. SHA-256 the joined string
+/// 5. Return the first 16 hex characters
 pub fn compute_fingerprint(files: &HashMap<String, FileEntry>) -> String {
-    let mut hasher = Sha256::new();
-
-    // Sort by path for deterministic ordering
-    let mut paths: Vec<&String> = files.keys().collect();
-    paths.sort();
-
-    for path in paths {
-        if let Some(entry) = files.get(path) {
-            hasher.update(path.as_bytes());
-            hasher.update(b":");
-            hasher.update(entry.sha256.as_bytes());
-            hasher.update(b"\n");
-        }
+    if files.is_empty() {
+        return String::new();
     }
 
+    // Build sorted list of "path:hash" entries
+    let mut entries: Vec<String> = files
+        .iter()
+        .map(|(path, entry)| format!("{}:{}", path, entry.sha256))
+        .collect();
+    entries.sort();
+
+    // Join with newline (no trailing newline per spec)
+    let joined = entries.join("\n");
+
+    // SHA-256 the joined string
+    let mut hasher = Sha256::new();
+    hasher.update(joined.as_bytes());
     let result = hasher.finalize();
-    hex_encode(&result)
+    let full_hash = hex_encode(&result);
+
+    // Return first 16 characters per PROTOCOL.md Section 2.3
+    full_hash[..16].to_string()
 }
 
 /// Check if a relative path falls under one of the syncable path prefixes.
@@ -173,7 +221,10 @@ fn is_syncable(rel_path: &str) -> bool {
         if sync_path.ends_with('/') {
             // Directory prefix match
             let prefix = sync_path.trim_end_matches('/');
-            if rel_path.starts_with(prefix) && (rel_path.len() == prefix.len() || rel_path.as_bytes()[prefix.len()] == b'/') {
+            if rel_path.starts_with(prefix)
+                && (rel_path.len() == prefix.len()
+                    || rel_path.as_bytes()[prefix.len()] == b'/')
+            {
                 return true;
             }
         } else {
@@ -299,5 +350,57 @@ mod tests {
     fn test_hex_encode() {
         assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
         assert_eq!(hex_encode(&[0x00, 0xff]), "00ff");
+    }
+
+    #[test]
+    fn test_compute_fingerprint_returns_16_chars() {
+        let mut files = HashMap::new();
+        files.insert(
+            "CLAUDE.md".to_string(),
+            FileEntry {
+                path: "CLAUDE.md".to_string(),
+                sha256: "abc123".to_string(),
+                size: 100,
+                executable: false,
+                mtime_epoch: 0,
+            },
+        );
+        let fp = compute_fingerprint(&files);
+        assert_eq!(fp.len(), 16, "Fingerprint should be 16 chars, got: {}", fp);
+    }
+
+    #[test]
+    fn test_compute_fingerprint_empty_returns_empty() {
+        let files = HashMap::new();
+        let fp = compute_fingerprint(&files);
+        assert!(fp.is_empty(), "Empty files should produce empty fingerprint");
+    }
+
+    #[test]
+    fn test_compute_fingerprint_deterministic() {
+        let mut files = HashMap::new();
+        files.insert(
+            "a.md".to_string(),
+            FileEntry {
+                path: "a.md".to_string(),
+                sha256: "hash_a".to_string(),
+                size: 10,
+                executable: false,
+                mtime_epoch: 0,
+            },
+        );
+        files.insert(
+            "b.md".to_string(),
+            FileEntry {
+                path: "b.md".to_string(),
+                sha256: "hash_b".to_string(),
+                size: 20,
+                executable: false,
+                mtime_epoch: 0,
+            },
+        );
+        let fp1 = compute_fingerprint(&files);
+        let fp2 = compute_fingerprint(&files);
+        assert_eq!(fp1, fp2, "Fingerprint should be deterministic");
     }
 }

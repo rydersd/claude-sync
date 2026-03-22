@@ -26,6 +26,8 @@ actor ConfigScanner {
 
     /// Paths that are eligible for sync (relative to baseDirectory).
     /// Entries ending with "/" are directory prefixes.
+    /// memory/ included so the entire "second brain" ecosystem syncs across machines
+    /// (voice profiles, story banks, feedback, project context, etc.)
     static let syncPaths: [String] = [
         "CLAUDE.md",
         "agents/",
@@ -33,6 +35,10 @@ actor ConfigScanner {
         "rules/",
         "hooks/",
         "scripts/",
+        "memory/",
+        "worksets/",
+        "plugins/",
+        "keybindings.json",
     ]
 
     /// Paths that are explicitly excluded from sync.
@@ -49,12 +55,16 @@ actor ConfigScanner {
         "state/",
         "plans/",
         "downloads/",
-        "plugins/",
         "shell-snapshots/",
         "paste-cache/",
         "file-history/",
         "debug/",
         "statsig/",
+        ".workset-vault/",
+        "worksets/_state.json",
+        "worksets/_affinity.json",
+        "teams/",
+        "tasks/",
     ]
 
     /// Filename patterns to exclude during directory traversal.
@@ -303,6 +313,20 @@ actor ConfigScanner {
         //   ? -> ? (same in LIKE)
         let predicate = NSPredicate(format: "SELF LIKE %@", pattern)
         return predicate.evaluate(with: string)
+    }
+
+    /// Scans and returns ManifestFileEntry objects for the protocol manifest message.
+    /// Uses the detailed scan to include size and mtime_epoch per PROTOCOL.md Section 4.2.
+    func scanForManifest() async -> [ManifestFileEntry] {
+        let configFiles = await scanDetailed()
+        return configFiles.map { file in
+            ManifestFileEntry(
+                path: file.relativePath,
+                sha256: file.hash,
+                size: Int(file.size),
+                mtimeEpoch: Int(file.modifiedDate.timeIntervalSince1970)
+            )
+        }
     }
 
     /// Reads the contents of a file at the given relative path.

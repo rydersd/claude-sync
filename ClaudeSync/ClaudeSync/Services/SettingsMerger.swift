@@ -16,16 +16,29 @@ enum SettingsMerger {
     private static let logger = Logger(subsystem: "com.claudesync", category: "SettingsMerger")
 
     /// Settings keys that are safe to sync across machines.
+    /// Per PROTOCOL.md Section 6.4, this is an explicit allowlist.
     static let portableKeys: Set<String> = [
         "hooks",
         "statusLine",
         "attribution",
+        "permissions",
+        "theme",
+        "teammateMode",
     ]
 
     /// Settings keys that are machine-specific and must never be synced.
+    /// Any key not in portableKeys is implicitly machine-specific.
     static let machineSpecificKeys: Set<String> = [
         "env",
-        "permissions",
+        "mcpServers",
+        "projects",
+    ]
+
+    /// Specific env var keys promoted to sync between machines.
+    /// The env block as a whole remains machine-specific — only these named keys transfer.
+    /// [EXPERIMENTAL → STANDARD]
+    static let recommendedEnvKeys: Set<String> = [
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
     ]
 
     // MARK: - Extraction
@@ -40,6 +53,20 @@ enum SettingsMerger {
                 portable[key] = value
             }
         }
+
+        // Extract recommended env keys (specific keys promoted from env block)
+        if let envDict = settings["env"] as? [String: Any] {
+            var recEnv: [String: Any] = [:]
+            for key in recommendedEnvKeys {
+                if let value = envDict[key] {
+                    recEnv[key] = value
+                }
+            }
+            if !recEnv.isEmpty {
+                portable["env"] = recEnv
+            }
+        }
+
         return portable
     }
 
@@ -89,7 +116,20 @@ enum SettingsMerger {
         // Start with local settings (preserves machine-specific keys).
         // Only merge the portable keys from remote.
         let portableOnly = extractPortable(from: remotePortableSettings)
-        return deepMerge(base: localSettings, overlay: portableOnly)
+        var result = deepMerge(base: localSettings, overlay: portableOnly)
+
+        // Merge recommended env keys without clobbering local env
+        if let remoteEnv = portableOnly["env"] as? [String: Any] {
+            var localEnv = result["env"] as? [String: Any] ?? [:]
+            for key in recommendedEnvKeys {
+                if let value = remoteEnv[key] {
+                    localEnv[key] = value
+                }
+            }
+            result["env"] = localEnv
+        }
+
+        return result
     }
 
     // MARK: - JSON Serialization

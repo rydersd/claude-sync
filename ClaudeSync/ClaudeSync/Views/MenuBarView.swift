@@ -4,6 +4,7 @@
 // The main content view displayed in the menu bar popover.
 // Shows online status, the list of discovered peers, and local config count.
 // Provides quick access to settings and refresh actions.
+// Includes auto-sync indicators, WAN peer sections, and tracker status.
 
 import SwiftUI
 
@@ -12,17 +13,40 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header with app name and online status.
+            // Header with app name, online status, and watching indicator.
             headerSection
 
             Divider()
 
-            // Peer list or empty state.
-            if networkManager.peers.isEmpty {
+            // Compact status dashboard showing LAN, Tracker, and Watcher at a glance.
+            StatusDashboard()
+                .environmentObject(networkManager)
+
+            Divider()
+
+            // Auto-sync toggle bar (compact).
+            autoSyncBar
+
+            Divider()
+
+            // LAN peer list or empty state.
+            if networkManager.peers.isEmpty && networkManager.wanPeers.isEmpty {
                 emptyPeerState
             } else {
                 peerListSection
+
+                // WAN peers section (shown only when WAN peers exist).
+                if !networkManager.wanPeers.isEmpty {
+                    Divider()
+                    wanPeerListSection
+                }
             }
+
+            Divider()
+
+            // Live activity feed showing sync events.
+            ActivitySection(activityLog: networkManager.activityLog)
+                .environmentObject(networkManager)
 
             Divider()
 
@@ -42,6 +66,19 @@ struct MenuBarView: View {
 
             Spacer()
 
+            // Watching indicator: green eye when file watcher is active.
+            if networkManager.isWatching {
+                HStack(spacing: 4) {
+                    Image(systemName: "eye.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                    Text("Watching")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                }
+                .padding(.trailing, 8)
+            }
+
             HStack(spacing: 4) {
                 Circle()
                     .fill(networkManager.isOnline ? Color.green : Color.red)
@@ -50,12 +87,55 @@ struct MenuBarView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            // Tracker connection indicator.
+            if !networkManager.syncConfig.trackers.isEmpty {
+                HStack(spacing: 3) {
+                    Circle()
+                        .fill(networkManager.isTrackerConnected ? Color.green : Color.red)
+                        .frame(width: 6, height: 6)
+                    Image(systemName: "globe")
+                        .font(.caption2)
+                        .foregroundStyle(networkManager.isTrackerConnected ? .green : .secondary)
+                }
+                .help(networkManager.isTrackerConnected ? "Tracker connected" : "Tracker disconnected")
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
     }
 
-    // MARK: - Peer List
+    // MARK: - Auto-Sync Bar
+
+    /// Compact toggle bar for enabling/disabling auto-sync directly from the menu.
+    private var autoSyncBar: some View {
+        HStack {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.caption)
+                .foregroundStyle(networkManager.isAutoSyncEnabled ? .green : .secondary)
+
+            Text("Auto-Sync")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { networkManager.isAutoSyncEnabled },
+                set: { _ in
+                    Task { await networkManager.toggleAutoSync() }
+                }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .labelsHidden()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(networkManager.isAutoSyncEnabled ? Color.green.opacity(0.05) : Color.clear)
+    }
+
+    // MARK: - LAN Peer List
 
     private var peerListSection: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -76,6 +156,36 @@ struct MenuBarView: View {
                 }
             }
             .frame(maxHeight: 400)
+        }
+    }
+
+    // MARK: - WAN Peer List
+
+    /// Separate section for peers discovered via tracker (WAN connections).
+    private var wanPeerListSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Image(systemName: "globe")
+                    .font(.caption2)
+                    .foregroundStyle(.purple)
+                Text("WAN PEERS")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fontWeight(.medium)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    ForEach(networkManager.wanPeers) { peer in
+                        PeerRowView(peer: peer)
+                            .environmentObject(networkManager)
+                    }
+                }
+            }
+            .frame(maxHeight: 200)
         }
     }
 
@@ -182,6 +292,7 @@ struct MenuBarView: View {
 // MARK: - Peer Row View
 
 /// A single row in the peer list showing peer status and quick actions.
+/// Includes auto-sync indicators and connection type badges.
 struct PeerRowView: View {
     @EnvironmentObject var networkManager: NetworkManager
     let peer: Peer
@@ -197,20 +308,80 @@ struct PeerRowView: View {
                 }
             } label: {
                 HStack(spacing: 10) {
-                    // Platform icon.
-                    Image(systemName: peer.platformIcon)
-                        .font(.title3)
-                        .foregroundStyle(.primary)
-                        .frame(width: 24)
+                    // Platform icon with connection type overlay.
+                    ZStack(alignment: .bottomTrailing) {
+                        Image(systemName: peer.platformIcon)
+                            .font(.title3)
+                            .foregroundStyle(.primary)
+                            .frame(width: 24)
 
-                    // Name and status.
+                        // Connection type icon (wifi for LAN, globe for WAN).
+                        Image(systemName: peer.connectionTypeIcon)
+                            .font(.system(size: 8))
+                            .foregroundStyle(peer.connectionType == .lan ? .blue : .purple)
+                            .offset(x: 2, y: 2)
+                    }
+
+                    // Name, status, and auto-sync info.
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(peer.name)
-                            .font(.subheadline)
-                            .fontWeight(.medium)
-                            .lineLimit(1)
+                        HStack(spacing: 4) {
+                            Text(peer.name)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                                .lineLimit(1)
 
-                        statusSubtitle
+                            // Pulsing green dot for peers with active auto-sync subscription.
+                            if peer.isAutoSyncSubscribed {
+                                Circle()
+                                    .fill(Color.green)
+                                    .frame(width: 6, height: 6)
+                                    .overlay(
+                                        Circle()
+                                            .fill(Color.green.opacity(0.4))
+                                            .frame(width: 10, height: 10)
+                                            .opacity(peer.isAutoSyncSubscribed ? 1 : 0)
+                                            .animation(
+                                                .easeInOut(duration: 1.0).repeatForever(autoreverses: true),
+                                                value: peer.isAutoSyncSubscribed
+                                            )
+                                    )
+                            }
+
+                            // Connection type label badge.
+                            Text(peer.connectionTypeLabel)
+                                .font(.system(size: 9, weight: .medium))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    peer.connectionType == .lan
+                                        ? Color.blue.opacity(0.15)
+                                        : peer.connectionType == .wan
+                                            ? Color.purple.opacity(0.15)
+                                            : Color.yellow.opacity(0.15)
+                                )
+                                .foregroundStyle(
+                                    peer.connectionType == .lan
+                                        ? .blue
+                                        : peer.connectionType == .wan
+                                            ? .purple
+                                            : .yellow
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                        }
+
+                        // Status subtitle with optional auto-sync timestamp.
+                        HStack(spacing: 4) {
+                            statusSubtitle
+
+                            if let lastSync = peer.lastAutoSyncDescription {
+                                Text("\u{00B7}")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                Text("Last sync: \(lastSync)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.green.opacity(0.8))
+                            }
+                        }
                     }
 
                     Spacer()

@@ -28,3 +28,15 @@ dirs = "5"
 hostname = "0.4"
 log = "0.4"
 env_logger = "0.11"
+notify = "7"                   # Cross-platform file system watching (OS-native events)
+chrono = "0.4"                 # Timestamp handling for change_epoch_ms
+rustls = "0.23"                # TLS for WAN peer connections
+rcgen = "0.13"                 # Self-signed certificate generation
+tokio-rustls = "0.26"          # Async TLS integration with tokio
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }  # WebSocket client for tracker
+ring = "0.17"                  # Cryptographic primitives (SHA-256 fingerprinting)
+x509-parser = "0.16"           # Parse X.509 certificates for fingerprint extraction
+rand = "0.8"                   # Random number generation for pairing codes
+time = "0.3"                   # Date/time types for X.509 certificate validity
+futures = "0.3"                # Async stream utilities (SplitSink/SplitStream for WebSocket)
+rustls-pemfile = "2"           # PEM file parsing for certificate loading

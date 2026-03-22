@@ -18,6 +18,7 @@
           <span class="status-dot offline"></span>
           <span id="status-text">Searching...</span>
         </span>
+        <button id="settings-btn" class="btn-settings" title="Settings">&#x2699;</button>
       </div>
     </header>
 
@@ -43,6 +44,10 @@
           <span class="value mono" id="device-fingerprint">--</span>
         </div>
       </div>
+    </section>
+
+    <section id="auto-sync-area" class="panel">
+      <!-- Auto-sync panel rendered here by JS -->
     </section>
 
     <section id="peers" class="panel">
@@ -103,8 +108,17 @@
       </div>
     </section>
 
+    <section id="settings-area">
+      <!-- Settings panel rendered here by JS (hidden by default) -->
+    </section>
+
     <footer>
-      <span class="footer-text">Peer-to-peer LAN sync for Claude Code configs</span>
+      <div class="footer-row">
+        <span class="footer-text">Peer-to-peer LAN sync for Claude Code configs</span>
+        <button id="open-folder-btn" class="btn-folder" title="Open ~/.claude/ in Finder to inspect or back up your files">
+          <span class="folder-icon">&#x1F4C2;</span> Open Config Folder
+        </button>
+      </div>
     </footer>
   </div>
 
