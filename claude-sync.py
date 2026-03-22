@@ -6657,13 +6657,21 @@ class ClaudeSync:
                     self.output.warning(f"  Could not fetch {f['name']} from {source}")
                     continue
 
-                # Compare hashes
-                local_hash = hashlib.sha256(f["content"].encode("utf-8")).hexdigest()
-                # Strip provenance lines from local for fair comparison
-                local_stripped = re.sub(r'^installed_from:.*\n?', '', f["content"], flags=re.MULTILINE)
-                local_stripped = re.sub(r'^installed_at:.*\n?', '', local_stripped, flags=re.MULTILINE)
+                # Compare hashes — strip provenance from frontmatter only (not body)
+                def _strip_provenance(text: str) -> str:
+                    fm = _FRONTMATTER_RE.match(text)
+                    if not fm:
+                        return text.rstrip()
+                    fm_text = fm.group(1)
+                    body = text[fm.end():]
+                    fm_lines = [l for l in fm_text.split('\n')
+                                if not l.startswith('installed_from:') and not l.startswith('installed_at:')]
+                    return ("---\n" + "\n".join(fm_lines) + "\n---" + body).rstrip()
+
+                local_stripped = _strip_provenance(f["content"])
+                remote_stripped = _strip_provenance(remote_content)
                 local_hash = hashlib.sha256(local_stripped.encode("utf-8")).hexdigest()
-                remote_hash = hashlib.sha256(remote_content.encode("utf-8")).hexdigest()
+                remote_hash = hashlib.sha256(remote_stripped.encode("utf-8")).hexdigest()
 
                 if local_hash == remote_hash:
                     self.output.detail(f"  {f['name']}: up to date")
@@ -6674,7 +6682,7 @@ class ClaudeSync:
 
                 # Show diff preview
                 local_lines = local_stripped.splitlines(keepends=True)
-                remote_lines = remote_content.splitlines(keepends=True)
+                remote_lines = remote_stripped.splitlines(keepends=True)
                 diff = list(difflib.unified_diff(local_lines, remote_lines, fromfile="local", tofile="remote"))
                 if diff:
                     for line in diff[:15]:
@@ -6912,16 +6920,21 @@ class ClaudeSync:
                 elif len(tool_list) > 8:
                     findings.append(("CRITICAL", "wildcard_tools", f"allowed-tools has {len(tool_list)} tools (>8 is suspicious)"))
 
-            # CRITICAL: suspicious_content
+            # CRITICAL: suspicious_content — check code blocks only to avoid false positives in docs
+            # Extract code blocks from body (fenced with ```)
+            code_blocks = re.findall(r'```[^\n]*\n(.*?)```', body, re.DOTALL)
+            code_content = "\n".join(code_blocks) if code_blocks else ""
             suspicious_patterns = [
-                (r'curl\s+.*-X\s*POST\b|curl\s+.*--data', "curl POST request detected"),
-                (r'\beval\s*\(', "eval() call detected"),
-                (r'\bexec\s*\(', "exec() call detected"),
-                (r'base64.*encode|base64\.b64encode', "base64 encoding detected"),
+                (r'curl\s+.*-X\s*POST\b|curl\s+.*--data', "curl POST request in code block"),
+                (r'\beval\s*\(', "eval() call in code block"),
+                (r'\bexec\s*\(', "exec() call in code block"),
+                (r'base64.*encode|base64\.b64encode', "base64 encoding in code block"),
                 (r'ngrok\.io|webhook\.site', "Suspicious URL (ngrok/webhook.site) detected"),
             ]
             for pattern, msg in suspicious_patterns:
-                if re.search(pattern, content, re.IGNORECASE):
+                # Check code blocks for most patterns, full body for URL patterns
+                search_in = body if "ngrok" in pattern else code_content
+                if re.search(pattern, search_in, re.IGNORECASE):
                     findings.append(("CRITICAL", "suspicious_content", msg))
 
             # WARNING: missing_description
@@ -7058,9 +7071,13 @@ class ClaudeSync:
                 req = urllib.request.Request(url, headers={"User-Agent": "claude-sync"})
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                    raw_repos = data if isinstance(data, list) else data.get("repos", [])
+                    # Validate entries: each must be a dict with a "repo" string key
+                    valid_repos = [r for r in raw_repos
+                                   if isinstance(r, dict) and isinstance(r.get("repo"), str)]
                     index = {
                         "fetched_at": _utcnow_iso(),
-                        "repos": data if isinstance(data, list) else data.get("repos", []),
+                        "repos": valid_repos,
                         "user_added": [],
                     }
                     # Preserve user_added from existing cache
@@ -7249,8 +7266,7 @@ class ClaudeSync:
 
         elif hub_command == "refresh":
             self.output.header("Hub - Refresh")
-            if cache_path.is_file():
-                cache_path.unlink()
+            # Fetch first, then write — don't delete cache before we have new data
             index = _fetch_index()
             count = len(_all_repos(index))
             self.output.success(f"Refreshed hub index ({count} repos)")
