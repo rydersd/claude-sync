@@ -44,6 +44,7 @@ import re
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import textwrap
 import threading
@@ -53,6 +54,16 @@ from dataclasses import asdict, dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+def _utcnow() -> datetime.datetime:
+    """Timezone-aware UTC now (no deprecation warning)."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _utcnow_iso() -> str:
+    """UTC now as ISO string with Z suffix."""
+    return _utcnow().strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 # Optional: watchdog for OS-native file system events (falls back to polling)
 try:
@@ -496,6 +507,13 @@ class Manifest:
     file_history: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    sync_fingerprint: Optional[str] = None
+
+    @staticmethod
+    def compute_fingerprint(file_hashes: Dict[str, str]) -> str:
+        """Compute a single hash representing the entire sync state."""
+        content = "\n".join(f"{k}:{v}" for k, v in sorted(file_hashes.items()))
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -512,21 +530,25 @@ class Manifest:
             file_history=data.get("file_history", {}),
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
+            sync_fingerprint=data.get("sync_fingerprint"),
         )
 
     def save(self, path: Path) -> None:
         """Save manifest to disk. Always writes as schema v2."""
-        now = datetime.datetime.utcnow().isoformat() + "Z"
+        now = _utcnow_iso()
         if not self.created_at:
             self.created_at = now
         self.updated_at = now
         self.schema_version = MANIFEST_SCHEMA_VERSION
+        # Compute fingerprint from current file hashes
+        self.sync_fingerprint = self.compute_fingerprint(self.files)
         data = {
             "schema_version": self.schema_version,
             "files": self.files,
             "last_push": self.last_push,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "sync_fingerprint": self.sync_fingerprint,
         }
         if self.last_pull is not None:
             data["last_pull"] = self.last_pull
@@ -543,7 +565,7 @@ class Manifest:
             "machine_id": str(uuid.getnode()),
             "hostname": platform.node(),
             "platform": platform.system(),
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": _utcnow_iso(),
             "python_version": platform.python_version(),
         }
 
@@ -559,7 +581,7 @@ class Manifest:
                             new_hashes: Dict[str, str]) -> None:
         """Append a history entry for each changed file, capped at FILE_HISTORY_MAX_ENTRIES."""
         entry_base = {
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": _utcnow_iso(),
             "machine_id": str(uuid.getnode()),
             "hostname": platform.node(),
             "action": action,
@@ -722,6 +744,70 @@ class Output:
             return False
 
 
+_FRONTMATTER_RE = re.compile(r'^---\n(.*?)\n---', re.DOTALL)
+_SYNC_META_KEYS = {'sync_hash', 'version', 'synced_at'}
+
+
+def stamp_frontmatter(file_path: Path, timestamp: Optional[str] = None) -> None:
+    """Stamp sync metadata (hash, version, timestamp) into YAML frontmatter of .md files.
+
+    Args:
+        file_path: Path to the .md file to stamp.
+        timestamp: Fixed ISO timestamp to use. If None, uses current UTC time.
+                   Pass the same value for src/dst to ensure identical output.
+    """
+    if file_path.suffix != '.md':
+        return
+    try:
+        text = file_path.read_text(encoding='utf-8')
+    except OSError:
+        return
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return
+
+    fm_text = match.group(1)
+    body = text[match.end():]
+
+    # Extract existing sync values
+    existing = {}
+    for line in fm_text.split('\n'):
+        if ':' in line:
+            key = line.split(':', 1)[0].strip()
+            val = line.split(':', 1)[1].strip()
+            existing[key] = val
+
+    # Compute hash of content WITHOUT sync metadata lines
+    clean_lines = [l for l in fm_text.split('\n')
+                   if not any(l.strip().startswith(k + ':') for k in _SYNC_META_KEYS)]
+    clean_content = '---\n' + '\n'.join(clean_lines) + '\n---' + body
+    content_hash = hashlib.sha256(clean_content.encode()).hexdigest()[:8]
+
+    # Determine version bump
+    old_hash = existing.get('sync_hash', '')
+    old_version = existing.get('version', '0.0.0')
+    if content_hash != old_hash:
+        try:
+            parts = old_version.split('.')
+            parts[2] = str(int(parts[2]) + 1)
+            new_version = '.'.join(parts)
+        except (IndexError, ValueError):
+            new_version = '0.0.1'
+    else:
+        new_version = old_version
+
+    ts = timestamp or _utcnow_iso()
+
+    # Build new frontmatter preserving all non-sync lines
+    new_fm = '\n'.join(clean_lines)
+    new_fm += f'\nsync_hash: {content_hash}'
+    new_fm += f'\nversion: {new_version}'
+    new_fm += f'\nsynced_at: {ts}'
+
+    new_text = f'---\n{new_fm}\n---{body}'
+    file_path.write_text(new_text, encoding='utf-8')
+
+
 class SyncEngine:
     """Push (home->repo) and pull (repo->home) with file copy."""
 
@@ -732,6 +818,8 @@ class SyncEngine:
     def push(self, diff_result: DiffResult, dry_run: bool = False) -> int:
         """Copy files from home to repo based on diff."""
         count = 0
+        errors = []
+        sync_ts = _utcnow_iso()  # Shared timestamp for all stamps in this push
         for change in diff_result.added + diff_result.modified:
             src = self.paths.relative_to_home(change.path)
             dst = self.paths.relative_to_repo(change.path)
@@ -739,9 +827,14 @@ class SyncEngine:
                 self.output.detail(f"Would copy {src} -> {dst}")
                 count += 1
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
-            count += 1
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                # Stamp home copy first, then copy to repo (so both are identical)
+                stamp_frontmatter(src, timestamp=sync_ts)
+                shutil.copy2(src, dst)
+                count += 1
+            except OSError as e:
+                errors.append(f"Failed to copy {change.path}: {e}")
 
         for change in diff_result.deleted:
             dst = self.paths.relative_to_repo(change.path)
@@ -749,17 +842,22 @@ class SyncEngine:
                 self.output.detail(f"Would delete {dst}")
                 count += 1
                 continue
-            if dst.exists():
-                dst.unlink()
-                count += 1
-                # Clean up empty parent directories
-                self._cleanup_empty_dirs(dst.parent, self.paths.repo_claude)
+            try:
+                if dst.exists():
+                    dst.unlink()
+                    count += 1
+                    self._cleanup_empty_dirs(dst.parent, self.paths.repo_claude)
+            except OSError as e:
+                errors.append(f"Failed to delete {change.path}: {e}")
 
+        for err in errors:
+            self.output.warning(f"  {err}")
         return count
 
     def pull(self, diff_result: DiffResult, dry_run: bool = False) -> int:
         """Copy files from repo to home based on diff."""
         count = 0
+        errors = []
         for change in diff_result.added + diff_result.modified:
             src = self.paths.relative_to_repo(change.path)
             dst = self.paths.relative_to_home(change.path)
@@ -767,12 +865,14 @@ class SyncEngine:
                 self.output.detail(f"Would copy {src} -> {dst}")
                 count += 1
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
-            # Set executable permission on .sh and .py files
-            if change.path.endswith(".sh") or change.path.endswith(".py"):
-                self._set_executable(dst)
-            count += 1
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                if change.path.endswith(".sh") or change.path.endswith(".py"):
+                    self._set_executable(dst)
+                count += 1
+            except OSError as e:
+                errors.append(f"Failed to copy {change.path}: {e}")
 
         for change in diff_result.deleted:
             dst = self.paths.relative_to_home(change.path)
@@ -780,18 +880,26 @@ class SyncEngine:
                 self.output.detail(f"Would delete {dst}")
                 count += 1
                 continue
-            if dst.exists():
-                dst.unlink()
-                count += 1
-                self._cleanup_empty_dirs(dst.parent, self.paths.home_claude)
+            try:
+                if dst.exists():
+                    dst.unlink()
+                    count += 1
+                    self._cleanup_empty_dirs(dst.parent, self.paths.home_claude)
+            except OSError as e:
+                errors.append(f"Failed to delete {change.path}: {e}")
 
+        for err in errors:
+            self.output.warning(f"  {err}")
         return count
 
     @staticmethod
     def _set_executable(path: Path) -> None:
         """Set +x permission on a file."""
-        current = path.stat().st_mode
-        path.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        try:
+            current = path.stat().st_mode
+            path.chmod(current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except OSError:
+            pass  # Non-fatal: file works, just not executable
 
     @staticmethod
     def _cleanup_empty_dirs(dir_path: Path, stop_at: Path) -> None:
@@ -843,6 +951,11 @@ class SecretScanner:
         ("Generic Secret", re.compile(r'(?:secret|token|api_key)\s*[=:]\s*["\'][^"\']{8,}["\']', re.IGNORECASE)),
     ]
 
+    # Lines matching these patterns are likely documentation/examples, not real secrets
+    PLACEHOLDER_INDICATORS = re.compile(
+        r'(?:example|placeholder|your_|<[^>]+>|TODO|CHANGEME|xxx|REPLACE_ME)', re.IGNORECASE
+    )
+
     @classmethod
     def scan_file(cls, path: Path, rel_path: str) -> List[SecretFinding]:
         """Scan a single file for secrets."""
@@ -852,7 +965,7 @@ class SecretScanner:
                 for line_num, line in enumerate(f, 1):
                     for pattern_name, regex in cls.PATTERNS:
                         match = regex.search(line)
-                        if match:
+                        if match and not cls.PLACEHOLDER_INDICATORS.search(line):
                             # Mask the matched text for display
                             text = match.group()
                             if len(text) > 12:
@@ -902,9 +1015,12 @@ class BackupManager:
             for rel_path in hashes:
                 src = source_dir / rel_path
                 dst = backup_path / rel_path
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(src), str(dst))
-                file_count += 1
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+                    file_count += 1
+                except OSError:
+                    pass  # Best-effort backup
 
         # Write backup metadata
         meta = {
@@ -912,7 +1028,7 @@ class BackupManager:
             "label": label,
             "source": str(source_dir),
             "file_count": file_count,
-            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "created_at": _utcnow_iso(),
         }
         with open(backup_path / ".backup-meta.json", "w") as f:
             json.dump(meta, f, indent=2)
@@ -952,8 +1068,11 @@ class BackupManager:
         for backup in backups[keep:]:
             path = Path(backup["path"])
             if path.exists():
-                shutil.rmtree(str(path))
-                pruned += 1
+                try:
+                    shutil.rmtree(path)
+                    pruned += 1
+                except OSError:
+                    pass  # Best-effort prune
         return pruned
 
     def get_backup(self, name: str) -> Optional[Path]:
@@ -1168,7 +1287,7 @@ class Doctor:
         if not self.paths.repo_root:
             return HealthCheck("git_clean", False, "No git repo", "")
         try:
-            import subprocess
+
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=str(self.paths.repo_root),
@@ -1816,7 +1935,7 @@ def handle_pair_command(args, output: Output) -> int:
             config["pending_pairings"] = {}
         config["pending_pairings"][pairing_code] = {
             "device_id": my_id,
-            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "created_at": _utcnow_iso(),
         }
         SyncConfig.save(config)
         return ExitCode.OK
@@ -1839,7 +1958,7 @@ def handle_pair_command(args, output: Output) -> int:
         config["paired_devices"].append({
             "device_id": device_id,
             "pairing_code": code,
-            "paired_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "paired_at": _utcnow_iso(),
             "paired_by": my_id,
         })
         SyncConfig.save(config)
@@ -2361,7 +2480,7 @@ class WorksetEngine:
     def _detect_project_key() -> Optional[str]:
         """Get project identity from git remote."""
         try:
-            import subprocess
+
             result = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
                 capture_output=True, text=True, timeout=5
@@ -3333,8 +3452,8 @@ class EcosystemAnalyzer:
     def find_stale(self, manifest: Manifest, days: int = 90) -> List[str]:
         """Find files not referenced in manifest history for N days."""
         stale = []
-        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
-        cutoff_str = cutoff.isoformat() + "Z"
+        cutoff = _utcnow() - datetime.timedelta(days=days)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
         files = self._collect_ecosystem_files()
         for f in files:
@@ -3343,7 +3462,7 @@ class EcosystemAnalyzer:
                 # No history at all — check file mtime as fallback
                 fpath = self.base_dir / f
                 try:
-                    mtime = datetime.datetime.utcfromtimestamp(fpath.stat().st_mtime)
+                    mtime = datetime.datetime.fromtimestamp(fpath.stat().st_mtime, tz=datetime.timezone.utc)
                     if mtime < cutoff:
                         stale.append(f)
                 except OSError:
@@ -3407,6 +3526,8 @@ class ClaudeSync:
             "pair": self._cmd_pair,
             "genome": self._cmd_genome,
             "workset": self._cmd_workset,
+            "version": self._cmd_version,
+            "release": self._cmd_release,
         }
         handler = handlers.get(self.args.command)
         if handler:
@@ -3620,6 +3741,18 @@ class ClaudeSync:
         ws_suggest = workset_sub.add_parser("suggest", help="Suggest workset based on project context")
         ws_suggest.add_argument("--auto", action="store_true",
                                 help="Auto-activate if confidence > 80%%")
+
+        # version
+        subparsers.add_parser("version", help="Quick sync version check (fingerprint comparison)")
+
+        # release
+        release_p = subparsers.add_parser("release", help="Tag and release to Homebrew tap")
+        release_p.add_argument("version_tag", help="Version tag (e.g. v1.4.0)")
+        release_p.add_argument("--formula-repo",
+                               help="Path to homebrew tap repo (default: from config or ~/Documents/GitHub/homebrew-tools)")
+        release_p.add_argument("--formula-path", default="Formula/claude-sync.rb",
+                               help="Path to formula within tap repo")
+        release_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
         return parser
 
@@ -3899,8 +4032,8 @@ class ClaudeSync:
                     ))
                 diff_result.conflicted.clear()
             elif theirs:
-                # Resolve all conflicts with remote (repo) version — skip them on push
-                self.output.info("  Resolving conflicts with --theirs (keeping repo version)")
+                # --theirs on push = "keep repo version, don't overwrite" = skip pushing conflicts
+                self.output.info("  Resolving conflicts with --theirs (keeping repo version, skipping push)")
                 diff_result.conflicted.clear()
             elif not force:
                 self.output.error(
@@ -4070,8 +4203,8 @@ class ClaudeSync:
                     ))
                 diff_result.conflicted.clear()
             elif ours:
-                # Resolve with local (home) version — skip them on pull
-                self.output.info("  Resolving conflicts with --ours (keeping home version)")
+                # --ours on pull = "keep home version, don't overwrite" = skip pulling conflicts
+                self.output.info("  Resolving conflicts with --ours (keeping home version, skipping pull)")
                 diff_result.conflicted.clear()
             elif not force:
                 self.output.error(
@@ -4602,8 +4735,6 @@ class ClaudeSync:
 
     def _eco_timeline(self) -> int:
         """Show ecosystem evolution from git history."""
-        import subprocess
-
         since = getattr(self.args, "since", None)
         self.output.header("Ecosystem timeline")
 
@@ -5274,7 +5405,7 @@ class ClaudeSync:
         and cowork settings — as a semantic layer on top of the raw file hashes.
         Used by status output, MCP server, and future GUI.
         """
-        now = datetime.datetime.utcnow().isoformat() + "Z"
+        now = _utcnow_iso()
         manifest: Dict[str, Any] = {
             "version": "1.3.0",
             "generated": now,
@@ -5695,6 +5826,179 @@ class ClaudeSync:
             self.output.set_json("suggestion", {
                 "workset": name, "confidence": confidence, "reason": reason
             })
+        return ExitCode.OK
+
+
+    # =========================================================================
+    # Version command
+    # =========================================================================
+
+    def _cmd_version(self) -> int:
+        """Fast version check — compare fingerprints without full diff."""
+        if not self._require_init():
+            return ExitCode.NOT_INITIALIZED
+
+        manifest = Manifest.load(self.paths.manifest_path)
+        fp = manifest.sync_fingerprint
+
+        if not fp:
+            self.output.warning("No fingerprint stored. Run push or pull first.")
+            if self.output.json_mode:
+                self.output.set_json("status", "no_fingerprint")
+            return ExitCode.DIRTY
+
+        home_hashes = FileHasher.walk_directory(self.paths.home_claude)
+        current_fp = Manifest.compute_fingerprint(home_hashes)
+
+        if self.output.json_mode:
+            self.output.set_json("synced_fingerprint", fp)
+            self.output.set_json("current_fingerprint", current_fp)
+            self.output.set_json("in_sync", current_fp == fp)
+
+        if current_fp == fp:
+            self.output.success(f"In sync  (fingerprint: {fp})")
+            return ExitCode.OK
+        else:
+            self.output.warning("Out of sync")
+            self.output.info(f"  Last synced: {fp}")
+            self.output.info(f"  Current:     {current_fp}")
+            self.output.info("  Run 'claude-sync diff' for details")
+            return ExitCode.DIRTY
+
+    # =========================================================================
+    # Release command
+    # =========================================================================
+
+    def _cmd_release(self) -> int:
+        """Tag release, update Homebrew formula, push everything."""
+        version = self.args.version_tag
+        yes = getattr(self.args, "yes", False)
+
+        if not re.match(r'^v\d+\.\d+\.\d+$', version):
+            self.output.error(f"Invalid version: {version}. Use vX.Y.Z format.")
+            return ExitCode.ERROR
+
+        self.output.header(f"Release: {version}")
+
+        # 1. Check git state
+        result = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True, timeout=10,
+            cwd=str(self.paths.repo_root) if self.paths.repo_root else ".",
+        )
+        if result.stdout.strip():
+            self.output.error("Git working tree is dirty. Commit or stash changes first.")
+            return ExitCode.ERROR
+
+        # 2. Check tag doesn't exist
+        result = subprocess.run(
+            ["git", "tag", "-l", version], capture_output=True, text=True, timeout=10,
+            cwd=str(self.paths.repo_root) if self.paths.repo_root else ".",
+        )
+        if version in result.stdout.strip().split('\n'):
+            self.output.error(f"Tag {version} already exists.")
+            return ExitCode.ERROR
+
+        # 3. Resolve formula repo path
+        formula_repo = getattr(self.args, "formula_repo", None)
+        if not formula_repo:
+            # Try config
+            config = SyncConfig.load()
+            formula_repo = config.get("homebrew_tap_repo", "")
+        if not formula_repo:
+            formula_repo = str(Path.home() / "Documents/GitHub/homebrew-tools")
+        formula_repo = Path(formula_repo).expanduser()
+        formula_path = formula_repo / getattr(self.args, "formula_path", "Formula/claude-sync.rb")
+
+        if not formula_path.exists():
+            self.output.error(f"Formula not found: {formula_path}")
+            return ExitCode.ERROR
+
+        self.output.info(f"  Tag:     {version}")
+        self.output.info(f"  Formula: {formula_path}")
+
+        if not yes and not self.output.confirm("Proceed with release?"):
+            self.output.info("Release cancelled.")
+            return ExitCode.OK
+
+        # 4. Tag and push
+        self.output.info("  Tagging...")
+        subprocess.run(["git", "tag", version], check=True,
+                        cwd=str(self.paths.repo_root) if self.paths.repo_root else ".")
+        subprocess.run(["git", "push", "origin", version], check=True,
+                        cwd=str(self.paths.repo_root) if self.paths.repo_root else ".")
+
+        # 5. Download archive and compute sha256
+        self.output.info("  Computing archive hash...")
+        # Read github_repo from git remote
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10,
+            cwd=str(self.paths.repo_root) if self.paths.repo_root else ".",
+        )
+        remote_url = result.stdout.strip()
+        # Extract owner/repo from URL
+        github_repo = ""
+        for pattern in [r'github\.com[:/](.+?)(?:\.git)?$']:
+            m = re.search(pattern, remote_url)
+            if m:
+                github_repo = m.group(1)
+                break
+
+        if not github_repo:
+            self.output.error(f"Could not parse GitHub repo from remote: {remote_url}")
+            return ExitCode.ERROR
+
+        archive_url = f"https://github.com/{github_repo}/archive/refs/tags/{version}.tar.gz"
+
+        # Download and hash
+        import urllib.request
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            urllib.request.urlretrieve(archive_url, tmp_path)
+            sha = hashlib.sha256()
+            with open(tmp_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    sha.update(chunk)
+            sha256_hash = sha.hexdigest()
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        self.output.info(f"  SHA256: {sha256_hash}")
+
+        # 6. Update formula
+        formula_text = formula_path.read_text()
+        formula_text = re.sub(
+            r'url "https://github\.com/.+?/archive/refs/tags/.*?"',
+            f'url "{archive_url}"',
+            formula_text,
+        )
+        formula_text = re.sub(
+            r'sha256 "[0-9a-f]+"',
+            f'sha256 "{sha256_hash}"',
+            formula_text,
+        )
+        formula_path.write_text(formula_text)
+
+        # 7. Commit and push formula
+        self.output.info("  Updating Homebrew tap...")
+        subprocess.run(["git", "add", str(formula_path.name)], check=True,
+                        cwd=str(formula_repo))
+        subprocess.run(
+            ["git", "commit", "-m", f"Bump claude-sync to {version}"],
+            check=True, cwd=str(formula_repo),
+        )
+        subprocess.run(["git", "push", "origin", "main"], check=True,
+                        cwd=str(formula_repo))
+
+        self.output.success(f"Released {version}")
+        self.output.info(f"  Users can run: brew upgrade claude-sync")
+
+        if self.output.json_mode:
+            self.output.set_json("status", "released")
+            self.output.set_json("version", version)
+            self.output.set_json("sha256", sha256_hash)
+
         return ExitCode.OK
 
 
