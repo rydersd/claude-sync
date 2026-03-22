@@ -828,13 +828,21 @@ def _parse_md_sections(content: str) -> List[Tuple[str, str]]:
         text = content
 
     sections: List[Tuple[str, str]] = []
+    # Normalize line endings for cross-platform compatibility
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
     lines = text.split('\n')
     current_heading = ""
     current_body_lines: List[str] = []
+    in_code_fence = False
 
     for line in lines:
-        # Match H1 headings only (not ## or ###)
-        if line.startswith('# ') and not line.startswith('## '):
+        # Track code fence state to avoid splitting on headings inside code blocks
+        stripped = line.strip()
+        if stripped.startswith('```'):
+            in_code_fence = not in_code_fence
+
+        # Match H1 headings only (not ## or ###), skip if inside code fence
+        if not in_code_fence and line.startswith('# ') and not line.startswith('## '):
             # Save previous section
             sections.append((current_heading, '\n'.join(current_body_lines)))
             current_heading = line
@@ -1321,7 +1329,7 @@ class MarkdownSectionMerger:
                     and not name_stripped.startswith('-')
                     and not name_stripped.startswith('.')
                     and len(name_stripped) > 2
-                    and name_stripped == name_stripped.lower().replace('-', '_').replace('_', name_stripped)):
+                    and re.match(r'^[a-z][a-z0-9_-]+$', name_stripped)):
                 # Looks like a potential agent/skill reference — but only flag
                 # if known_items is non-empty (we have something to check against)
                 if known_items and name_stripped not in known_items:
@@ -5808,13 +5816,10 @@ class ClaudeSync:
         if not self.output.is_tty:
             return 0
 
-        # Determine file paths based on direction
-        if direction == "pull":
-            local_path = self.paths.home_claude / claude_md_path
-            remote_path = self.paths.repo_claude / claude_md_path
-        else:  # push
-            local_path = self.paths.home_claude / claude_md_path
-            remote_path = self.paths.repo_claude / claude_md_path
+        # Determine file paths — "local" is always where we keep the result,
+        # "remote" is the incoming version we're comparing against
+        local_path = self.paths.home_claude / claude_md_path
+        remote_path = self.paths.repo_claude / claude_md_path
 
         # Read both files — if either can't be read, bail out
         try:
@@ -5850,16 +5855,28 @@ class ClaudeSync:
         accept_map: Dict[str, str] = {}
 
         # Auto-accept modes (non-interactive resolution)
-        if yes or (direction == "pull" and theirs) or (direction == "push" and ours):
-            # Accept all remote sections
+        # For pull: --yes/--theirs = accept repo version; --ours = keep home version
+        # For push: --yes/--ours = push home version (let wholesale copy proceed); --theirs = keep repo
+        if direction == "push" and (yes or ours):
+            # Push: user wants to push their home version — let wholesale copy proceed
+            return 0
+        elif direction == "push" and theirs:
+            # Push: user wants to keep repo version — skip CLAUDE.md in push
+            if change_list_name == "added":
+                diff_result.added = [c for c in diff_result.added if c.path != claude_md_path]
+            elif change_list_name == "modified":
+                diff_result.modified = [c for c in diff_result.modified if c.path != claude_md_path]
+            return 1
+        elif yes or (direction == "pull" and theirs):
+            # Pull: accept all remote (repo) sections
             for heading, _lb, _rb in section_diff["modified"]:
                 accept_map[heading] = "remote"
             for heading, _body in section_diff["added"]:
                 accept_map[heading] = "remote"
             for heading, _body in section_diff["removed"]:
                 accept_map[heading] = "remove"
-        elif (direction == "pull" and ours) or (direction == "push" and theirs):
-            # Keep all local — remove CLAUDE.md from diff so engine skips it
+        elif direction == "pull" and ours:
+            # Pull: keep all local (home) — remove CLAUDE.md from diff so engine skips it
             if change_list_name == "added":
                 diff_result.added = [c for c in diff_result.added if c.path != claude_md_path]
             elif change_list_name == "modified":
@@ -5890,7 +5907,13 @@ class ClaudeSync:
                 choice = input("\n  [a]ccept all remote / [k]eep all local / [r]eview each? [r] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
-                return 0
+                # Remove CLAUDE.md from diff to prevent wholesale overwrite
+                if change_list_name == "added":
+                    diff_result.added = [c for c in diff_result.added if c.path != claude_md_path]
+                elif change_list_name == "modified":
+                    diff_result.modified = [c for c in diff_result.modified if c.path != claude_md_path]
+                self.output.info("  Cancelled — CLAUDE.md left unchanged.")
+                return 1
 
             if choice == 'a':
                 for heading, _lb, _rb in section_diff["modified"]:
@@ -5963,21 +5986,48 @@ class ClaudeSync:
             local_sections, remote_sections, accept_map
         )
 
-        # Preserve frontmatter from the LOCAL file (it has sync metadata)
+        # Preserve frontmatter — prefer local (has sync metadata), fall back to remote
         local_fm_match = _FRONTMATTER_RE.match(local_content)
+        remote_fm_match = _FRONTMATTER_RE.match(remote_content)
         if local_fm_match:
             merged_content = local_content[:local_fm_match.end()] + merged_body
+        elif remote_fm_match:
+            merged_content = remote_content[:remote_fm_match.end()] + merged_body
         else:
             merged_content = merged_body
 
-        # Write merged content to the appropriate destination
+        # Write merged content atomically (temp file + rename to prevent corruption)
         try:
+            import tempfile
             if direction == "pull":
                 dest_path = self.paths.home_claude / claude_md_path
             else:
+                # Push: write to BOTH repo and home so they stay in sync
+                # (prevents infinite merge loop on subsequent pushes)
                 dest_path = self.paths.repo_claude / claude_md_path
+                home_path = self.paths.home_claude / claude_md_path
+                home_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_fd, tmp_name = tempfile.mkstemp(dir=str(home_path.parent), suffix='.md')
+                try:
+                    os.write(tmp_fd, merged_content.encode('utf-8'))
+                    os.close(tmp_fd)
+                    os.replace(tmp_name, str(home_path))
+                except Exception:
+                    try:
+                        os.close(tmp_fd)
+                    except OSError:
+                        pass
+                    Path(tmp_name).unlink(missing_ok=True)
+                    raise
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            dest_path.write_text(merged_content, encoding='utf-8')
+            tmp_fd, tmp_name = tempfile.mkstemp(dir=str(dest_path.parent), suffix='.md')
+            try:
+                os.write(tmp_fd, merged_content.encode('utf-8'))
+                os.close(tmp_fd)
+                os.replace(tmp_name, str(dest_path))
+            except Exception:
+                Path(tmp_name).unlink(missing_ok=True)
+                raise
         except OSError as e:
             self.output.warning(f"  Failed to write merged CLAUDE.md: {e}")
             return 0
