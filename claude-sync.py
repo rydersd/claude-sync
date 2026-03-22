@@ -82,6 +82,7 @@ SYNC_PATHS = [
     "hooks/",
     "scripts/",
     "memory/",
+    "worksets/",
 ]
 
 # Paths that NEVER sync
@@ -104,6 +105,9 @@ EXCLUDE_PATHS = [
     "file-history/",
     "debug/",
     "statsig/",
+    ".workset-vault/",
+    "worksets/_state.json",
+    "worksets/_affinity.json",
 ]
 
 # Exclusion patterns for tree walking
@@ -1817,7 +1821,615 @@ class SimilarityPair:
 
 
 # =============================================================================
-# Phase 7: Skill Genome
+# Phase 7a: Worksets
+# =============================================================================
+
+@dataclass
+class WorksetDefinition:
+    """A named workset configuration for activating agent/skill subsets."""
+    name: str
+    description: str = ""
+    tags: List[str] = field(default_factory=list)
+    agents: List[str] = field(default_factory=list)
+    skills: List[str] = field(default_factory=list)
+    exclude_agents: List[str] = field(default_factory=list)
+    exclude_skills: List[str] = field(default_factory=list)
+    extends: List[str] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorksetDefinition":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class WorksetState:
+    """Current workset activation state (machine-local)."""
+    active_workset: Optional[str] = None
+    activated_at: Optional[str] = None
+    resolved_agents: List[str] = field(default_factory=list)
+    resolved_skills: List[str] = field(default_factory=list)
+    vault_initialized: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorksetState":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+class WorksetEngine:
+    """Vault-based workset management with hardlink activation."""
+
+    PENDING_MARKER = ".workset-pending"
+
+    def __init__(self, home_dir: Path):
+        self.home_dir = home_dir
+        self.vault_dir = home_dir / ".workset-vault"
+        self.worksets_dir = home_dir / "worksets"
+        self.state_path = self.worksets_dir / "_state.json"
+        self.affinity_path = self.worksets_dir / "_affinity.json"
+        self.agents_dir = home_dir / "agents"
+        self.skills_dir = home_dir / "skills"
+
+    # ---- State management ----
+
+    def load_state(self) -> WorksetState:
+        if self.state_path.exists():
+            try:
+                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+                return WorksetState.from_dict(data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return WorksetState()
+
+    def save_state(self, state: WorksetState) -> None:
+        self.worksets_dir.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(
+            json.dumps(state.to_dict(), indent=2) + "\n", encoding="utf-8"
+        )
+
+    # ---- Definition management ----
+
+    def load_definitions(self) -> Dict[str, WorksetDefinition]:
+        defs = {}
+        if not self.worksets_dir.exists():
+            return defs
+        for f in sorted(self.worksets_dir.glob("*.json")):
+            if f.name.startswith("_"):
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                ws = WorksetDefinition.from_dict(data)
+                defs[ws.name] = ws
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
+        return defs
+
+    def save_definition(self, ws: WorksetDefinition) -> Path:
+        self.worksets_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if not ws.created_at:
+            ws.created_at = now
+        ws.updated_at = now
+        path = self.worksets_dir / f"{ws.name}.json"
+        path.write_text(json.dumps(ws.to_dict(), indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def delete_definition(self, name: str) -> bool:
+        path = self.worksets_dir / f"{name}.json"
+        if path.exists():
+            path.unlink()
+            return True
+        return False
+
+    # ---- Tag parsing ----
+
+    def parse_agent_tags(self) -> Dict[str, List[str]]:
+        """Parse tags from all agent frontmatter in the vault (or agents dir if no vault)."""
+        source = self.vault_dir / "agents" if self.vault_dir.exists() else self.agents_dir
+        result: Dict[str, List[str]] = {}
+        if not source.exists():
+            return result
+        for f in source.glob("*.md"):
+            name = f.stem
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            tags = self._extract_tags(content)
+            result[name] = tags
+        return result
+
+    @staticmethod
+    def _extract_tags(content: str) -> List[str]:
+        """Extract tags list from YAML frontmatter."""
+        if not content.startswith("---"):
+            return []
+        end = content.find("---", 3)
+        if end <= 0:
+            return []
+        fm = content[3:end]
+        for line in fm.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("tags:"):
+                val = stripped[5:].strip()
+                if val.startswith("[") and val.endswith("]"):
+                    items = val[1:-1].split(",")
+                    return [item.strip().strip('"').strip("'") for item in items if item.strip()]
+                elif val:
+                    return [val.strip('"').strip("'")]
+        return []
+
+    # ---- Resolution ----
+
+    def resolve_workset(self, name: str, definitions: Optional[Dict[str, WorksetDefinition]] = None,
+                        _visited: Optional[Set[str]] = None) -> tuple:
+        """Resolve a workset into concrete agent and skill lists.
+
+        Returns (agent_names: List[str], skill_names: List[str]).
+        """
+        if definitions is None:
+            definitions = self.load_definitions()
+        if _visited is None:
+            _visited = set()
+
+        if name in _visited:
+            return [], []
+        _visited.add(name)
+
+        ws = definitions.get(name)
+        if not ws:
+            return [], []
+
+        agents: Set[str] = set()
+        skills: Set[str] = set()
+
+        # 1. Expand extends (recursive, cycle-detected)
+        for parent_name in ws.extends:
+            p_agents, p_skills = self.resolve_workset(parent_name, definitions, _visited)
+            agents.update(p_agents)
+            skills.update(p_skills)
+
+        # 2. Expand tags
+        if ws.tags:
+            agent_tags = self.parse_agent_tags()
+            for agent_name, atags in agent_tags.items():
+                for t in ws.tags:
+                    if t.lower() in [at.lower() for at in atags]:
+                        agents.add(agent_name)
+                        break
+
+        # 3. Add explicit agents/skills
+        agents.update(ws.agents)
+        skills.update(ws.skills)
+
+        # 4. Resolve skill dependencies: auto-include required agents
+        #    Match skills to agents by name (most skills share agent names)
+        source = self.vault_dir / "skills" if self.vault_dir.exists() else self.skills_dir
+        if source.exists():
+            for skill_name in list(skills):
+                skill_md = source / skill_name / "SKILL.md"
+                if skill_md.exists():
+                    self._resolve_skill_deps(skill_md, agents, skills)
+
+        # For agents without matching skills, auto-include the matching skill if it exists
+        for agent_name in list(agents):
+            skill_dir = source / agent_name
+            if skill_dir.exists() and (skill_dir / "SKILL.md").exists():
+                skills.add(agent_name)
+
+        # 5. Apply exclusions last
+        agents -= set(ws.exclude_agents)
+        skills -= set(ws.exclude_skills)
+
+        return sorted(agents), sorted(skills)
+
+    def _resolve_skill_deps(self, skill_md: Path, agents: Set[str], skills: Set[str]) -> None:
+        """Parse skill SKILL.md for requires: block and add dependencies."""
+        try:
+            content = skill_md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        if not content.startswith("---"):
+            return
+        end = content.find("---", 3)
+        if end <= 0:
+            return
+        fm = content[3:end]
+        in_requires = False
+        for line in fm.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("requires:"):
+                in_requires = True
+                continue
+            if in_requires:
+                if not line.startswith((" ", "\t")) and stripped:
+                    break
+                if stripped.startswith("agents:"):
+                    val = stripped[7:].strip()
+                    if val.startswith("["):
+                        items = val[1:].rstrip("]").split(",")
+                        agents.update(i.strip().strip('"').strip("'") for i in items if i.strip())
+                elif stripped.startswith("skills:"):
+                    val = stripped[7:].strip()
+                    if val.startswith("["):
+                        items = val[1:].rstrip("]").split(",")
+                        skills.update(i.strip().strip('"').strip("'") for i in items if i.strip())
+
+    # ---- Vault management ----
+
+    def init_vault(self) -> tuple:
+        """One-time migration: move agents/skills to vault, hardlink back.
+
+        Returns (agent_count, skill_count).
+        """
+        state = self.load_state()
+        if state.vault_initialized and self.vault_dir.exists():
+            # Already initialized — reconcile by copying any new files to vault
+            self._reconcile_vault()
+            return self._count_vault()
+
+        # Create vault directories
+        vault_agents = self.vault_dir / "agents"
+        vault_skills = self.vault_dir / "skills"
+        vault_agents.mkdir(parents=True, exist_ok=True)
+        vault_skills.mkdir(parents=True, exist_ok=True)
+
+        # Move agents to vault
+        agent_count = 0
+        if self.agents_dir.exists():
+            for f in self.agents_dir.glob("*.md"):
+                dest = vault_agents / f.name
+                shutil.copy2(str(f), str(dest))
+                agent_count += 1
+
+        # Move skills to vault (entire directories)
+        skill_count = 0
+        if self.skills_dir.exists():
+            for d in self.skills_dir.iterdir():
+                if d.is_dir() and not d.name.startswith("_"):
+                    dest = vault_skills / d.name
+                    if not dest.exists():
+                        shutil.copytree(str(d), str(dest))
+                    skill_count += 1
+                elif d.is_file():
+                    # Copy loose files (skill-rules.json etc)
+                    dest = vault_skills / d.name
+                    shutil.copy2(str(d), str(dest))
+
+        # Mark as initialized
+        state.vault_initialized = True
+        state.active_workset = None
+        self.save_state(state)
+
+        # Hardlink everything back (full set active by default)
+        self._activate_all()
+
+        return agent_count, skill_count
+
+    def _reconcile_vault(self) -> None:
+        """Copy any agents/skills from active dirs that aren't in vault yet."""
+        vault_agents = self.vault_dir / "agents"
+        vault_skills = self.vault_dir / "skills"
+        if self.agents_dir.exists():
+            for f in self.agents_dir.glob("*.md"):
+                dest = vault_agents / f.name
+                if not dest.exists():
+                    shutil.copy2(str(f), str(dest))
+        if self.skills_dir.exists():
+            for d in self.skills_dir.iterdir():
+                if d.is_dir() and not d.name.startswith("_"):
+                    dest = vault_skills / d.name
+                    if not dest.exists():
+                        shutil.copytree(str(d), str(dest))
+
+    def _count_vault(self) -> tuple:
+        vault_agents = self.vault_dir / "agents"
+        vault_skills = self.vault_dir / "skills"
+        ac = len(list(vault_agents.glob("*.md"))) if vault_agents.exists() else 0
+        sc = len([d for d in vault_skills.iterdir() if d.is_dir()]) if vault_skills.exists() else 0
+        return ac, sc
+
+    # ---- Activation ----
+
+    def activate(self, name: str) -> tuple:
+        """Activate a workset: populate agents/skills with subset from vault.
+
+        Returns (agent_count, skill_count).
+        """
+        state = self.load_state()
+        if not state.vault_initialized:
+            raise RuntimeError("Vault not initialized. Run 'claude-sync workset init' first.")
+
+        definitions = self.load_definitions()
+        if name not in definitions:
+            raise ValueError(f"Workset '{name}' not found. Available: {', '.join(definitions.keys())}")
+
+        agents, skills = self.resolve_workset(name, definitions)
+
+        # Write pending marker for crash recovery
+        pending = self.home_dir / self.PENDING_MARKER
+        pending.write_text(name, encoding="utf-8")
+
+        try:
+            # Clear active directories
+            self._clear_active_dirs()
+
+            # Hardlink agents from vault
+            vault_agents = self.vault_dir / "agents"
+            self.agents_dir.mkdir(exist_ok=True)
+            linked_agents = 0
+            for agent_name in agents:
+                src = vault_agents / f"{agent_name}.md"
+                if src.exists():
+                    self._hardlink_or_copy(src, self.agents_dir / f"{agent_name}.md")
+                    linked_agents += 1
+
+            # Hardlink skills from vault
+            vault_skills = self.vault_dir / "skills"
+            self.skills_dir.mkdir(exist_ok=True)
+            linked_skills = 0
+            for skill_name in skills:
+                src_dir = vault_skills / skill_name
+                if src_dir.is_dir():
+                    self._hardlink_tree(src_dir, self.skills_dir / skill_name)
+                    linked_skills += 1
+            # Also copy loose files in skills/ (like skill-rules.json)
+            for f in vault_skills.iterdir():
+                if f.is_file():
+                    self._hardlink_or_copy(f, self.skills_dir / f.name)
+
+            # Update state
+            state.active_workset = name
+            state.activated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            state.resolved_agents = agents
+            state.resolved_skills = skills
+            self.save_state(state)
+
+            # Record affinity
+            self._record_affinity(name)
+
+        finally:
+            # Remove pending marker
+            if pending.exists():
+                pending.unlink()
+
+        return linked_agents, linked_skills
+
+    def deactivate(self) -> tuple:
+        """Restore full set from vault. Returns (agent_count, skill_count)."""
+        state = self.load_state()
+        if not state.vault_initialized:
+            raise RuntimeError("Vault not initialized.")
+
+        self._activate_all()
+
+        state.active_workset = None
+        state.activated_at = None
+        state.resolved_agents = []
+        state.resolved_skills = []
+        self.save_state(state)
+
+        return self._count_active()
+
+    def _activate_all(self) -> None:
+        """Hardlink everything from vault to active directories."""
+        self._clear_active_dirs()
+
+        vault_agents = self.vault_dir / "agents"
+        vault_skills = self.vault_dir / "skills"
+
+        self.agents_dir.mkdir(exist_ok=True)
+        self.skills_dir.mkdir(exist_ok=True)
+
+        if vault_agents.exists():
+            for f in vault_agents.glob("*.md"):
+                self._hardlink_or_copy(f, self.agents_dir / f.name)
+
+        if vault_skills.exists():
+            for item in vault_skills.iterdir():
+                if item.is_dir():
+                    self._hardlink_tree(item, self.skills_dir / item.name)
+                elif item.is_file():
+                    self._hardlink_or_copy(item, self.skills_dir / item.name)
+
+    def _clear_active_dirs(self) -> None:
+        """Remove all contents of agents/ and skills/ directories."""
+        if self.agents_dir.exists():
+            shutil.rmtree(str(self.agents_dir))
+        if self.skills_dir.exists():
+            shutil.rmtree(str(self.skills_dir))
+
+    def _count_active(self) -> tuple:
+        ac = len(list(self.agents_dir.glob("*.md"))) if self.agents_dir.exists() else 0
+        sc = len([d for d in self.skills_dir.iterdir() if d.is_dir()]) if self.skills_dir.exists() else 0
+        return ac, sc
+
+    @staticmethod
+    def _hardlink_or_copy(src: Path, dest: Path) -> None:
+        """Create hardlink, falling back to copy if cross-filesystem."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(str(src), str(dest))
+        except OSError:
+            shutil.copy2(str(src), str(dest))
+
+    @staticmethod
+    def _hardlink_tree(src_dir: Path, dest_dir: Path) -> None:
+        """Recursively hardlink a directory tree."""
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for item in src_dir.iterdir():
+            dest = dest_dir / item.name
+            if item.is_dir():
+                WorksetEngine._hardlink_tree(item, dest)
+            elif item.is_file():
+                WorksetEngine._hardlink_or_copy(item, dest)
+
+    # ---- Affinity Engine ----
+
+    def _load_affinity(self) -> dict:
+        if self.affinity_path.exists():
+            try:
+                return json.loads(self.affinity_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {"projects": {}, "language_affinity": {}}
+
+    def _save_affinity(self, data: dict) -> None:
+        self.worksets_dir.mkdir(parents=True, exist_ok=True)
+        self.affinity_path.write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _record_affinity(self, workset_name: str) -> None:
+        """Record this activation in affinity data."""
+        affinity = self._load_affinity()
+        project_key = self._detect_project_key()
+        languages = self._detect_languages()
+
+        if project_key:
+            proj = affinity["projects"].setdefault(project_key, {
+                "activations": {}, "languages": [], "last_workset": None,
+                "last_activated": None,
+            })
+            proj["activations"][workset_name] = proj["activations"].get(workset_name, 0) + 1
+            proj["languages"] = languages
+            proj["last_workset"] = workset_name
+            proj["last_activated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        for lang in languages:
+            lang_entry = affinity["language_affinity"].setdefault(lang, {})
+            lang_entry[workset_name] = lang_entry.get(workset_name, 0) + 1
+
+        self._save_affinity(affinity)
+
+    @staticmethod
+    def _detect_project_key() -> Optional[str]:
+        """Get project identity from git remote."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                url = result.stdout.strip()
+                # Normalize: git@github.com:user/repo.git -> github.com/user/repo
+                url = re.sub(r"^(https?://|git@)", "", url)
+                url = re.sub(r"\.git$", "", url)
+                url = url.replace(":", "/")
+                return url
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _detect_languages() -> List[str]:
+        """Detect languages in current directory by file extensions and markers."""
+        cwd = Path.cwd()
+        lang_map = {
+            "Package.swift": "swift", "*.xcodeproj": "swift",
+            "package.json": "javascript", "tsconfig.json": "typescript",
+            "Cargo.toml": "rust", "go.mod": "go",
+            "pyproject.toml": "python", "setup.py": "python", "requirements.txt": "python",
+            "Gemfile": "ruby", "build.gradle": "kotlin", "pom.xml": "java",
+        }
+        detected = set()
+        for marker, lang in lang_map.items():
+            if "*" in marker:
+                if list(cwd.glob(marker)):
+                    detected.add(lang)
+            elif (cwd / marker).exists():
+                detected.add(lang)
+
+        # Also check common file extensions in top-level src
+        ext_map = {".swift": "swift", ".py": "python", ".ts": "typescript",
+                   ".js": "javascript", ".rs": "rust", ".go": "go", ".rb": "ruby",
+                   ".java": "java", ".kt": "kotlin"}
+        try:
+            for f in list(cwd.rglob("*"))[:500]:  # Cap to avoid slow repos
+                if f.suffix in ext_map:
+                    detected.add(ext_map[f.suffix])
+        except OSError:
+            pass
+        return sorted(detected)
+
+    def suggest_workset(self) -> Optional[tuple]:
+        """Suggest a workset based on project affinity.
+
+        Returns (workset_name, confidence, reason) or None.
+        """
+        affinity = self._load_affinity()
+        definitions = self.load_definitions()
+        if not definitions:
+            return None
+
+        # Strategy 1: Project-based affinity
+        project_key = self._detect_project_key()
+        if project_key and project_key in affinity.get("projects", {}):
+            proj = affinity["projects"][project_key]
+            activations = proj.get("activations", {})
+            if activations:
+                total = sum(activations.values())
+                best = max(activations, key=activations.get)
+                confidence = activations[best] / total if total > 0 else 0
+                if best in definitions:
+                    return (best, confidence, f"Used {activations[best]}/{total} times for {project_key}")
+
+        # Strategy 2: Language-based affinity
+        languages = self._detect_languages()
+        if languages and affinity.get("language_affinity"):
+            scores: Dict[str, int] = {}
+            for lang in languages:
+                lang_affinities = affinity["language_affinity"].get(lang, {})
+                for ws_name, count in lang_affinities.items():
+                    if ws_name in definitions:
+                        scores[ws_name] = scores.get(ws_name, 0) + count
+            if scores:
+                best = max(scores, key=scores.get)
+                total = sum(scores.values())
+                confidence = scores[best] / total if total > 0 else 0
+                return (best, confidence, f"Language match ({', '.join(languages)})")
+
+        # Strategy 3: Tag matching against project markers
+        if languages:
+            lang_tag_map = {
+                "swift": ["Dev"], "python": ["Dev"], "typescript": ["Dev"],
+                "javascript": ["Dev"], "rust": ["Dev"], "go": ["Dev"],
+            }
+            matched_tags = set()
+            for lang in languages:
+                matched_tags.update(lang_tag_map.get(lang, []))
+            if matched_tags:
+                for ws_name, ws_def in definitions.items():
+                    if set(ws_def.tags) & matched_tags:
+                        return (ws_name, 0.3, f"Tag match from detected languages")
+
+        return None
+
+    # ---- Recovery ----
+
+    def recover_if_needed(self) -> bool:
+        """Check for interrupted activation and recover."""
+        pending = self.home_dir / self.PENDING_MARKER
+        if pending.exists():
+            pending.unlink()
+            self._activate_all()
+            state = self.load_state()
+            state.active_workset = None
+            self.save_state(state)
+            return True
+        return False
+
+
+# =============================================================================
+# Phase 7b: Skill Genome
 # =============================================================================
 
 @dataclass
@@ -2746,6 +3358,7 @@ class ClaudeSync:
             "tracker": self._cmd_tracker,
             "pair": self._cmd_pair,
             "genome": self._cmd_genome,
+            "workset": self._cmd_workset,
         }
         handler = handlers.get(self.args.command)
         if handler:
@@ -2924,6 +3537,42 @@ class ClaudeSync:
         package_p.add_argument("skill", help="Skill name to package")
         package_p.add_argument("--output", "-o", help="Output path (default: <skill>.tar.gz)")
 
+        # workset
+        workset_parser = subparsers.add_parser("workset", help="Manage agent/skill worksets")
+        workset_sub = workset_parser.add_subparsers(dest="workset_command")
+
+        workset_sub.add_parser("init", help="Initialize vault (one-time setup)")
+
+        ws_create = workset_sub.add_parser("create", help="Create a new workset")
+        ws_create.add_argument("name", help="Workset name (e.g., dev, design, writing)")
+        ws_create.add_argument("--tags", help="Comma-separated tags to include (e.g., Dev,Design)")
+        ws_create.add_argument("--agents", help="Comma-separated agent names to include")
+        ws_create.add_argument("--skills", help="Comma-separated skill names to include")
+        ws_create.add_argument("--exclude-agents", help="Comma-separated agents to exclude")
+        ws_create.add_argument("--exclude-skills", help="Comma-separated skills to exclude")
+        ws_create.add_argument("--extends", help="Comma-separated parent workset names")
+        ws_create.add_argument("--description", "-d", help="Workset description")
+
+        ws_show = workset_sub.add_parser("show", help="Show resolved workset contents")
+        ws_show.add_argument("name", help="Workset name")
+        ws_show.add_argument("--resolved", action="store_true", help="Show fully resolved agent/skill list")
+
+        workset_sub.add_parser("list", help="List all defined worksets")
+
+        ws_activate = workset_sub.add_parser("activate", help="Activate a workset")
+        ws_activate.add_argument("name", help="Workset name to activate")
+
+        workset_sub.add_parser("deactivate", help="Restore full agent/skill set")
+
+        ws_delete = workset_sub.add_parser("delete", help="Delete a workset definition")
+        ws_delete.add_argument("name", help="Workset name to delete")
+
+        workset_sub.add_parser("status", help="Show current workset activation state")
+
+        ws_suggest = workset_sub.add_parser("suggest", help="Suggest workset based on project context")
+        ws_suggest.add_argument("--auto", action="store_true",
+                                help="Auto-activate if confidence > 80%%")
+
         return parser
 
     def _require_init(self) -> bool:
@@ -3091,6 +3740,27 @@ class ClaudeSync:
         if not self._require_init():
             return ExitCode.NOT_INITIALIZED
 
+        # Bracket: deactivate workset so push sees full agent/skill set
+        ws_engine = WorksetEngine(self.paths.home_claude)
+        ws_state = ws_engine.load_state()
+        ws_was_active = ws_state.active_workset if ws_state.vault_initialized else None
+        if ws_was_active:
+            ws_engine.deactivate()
+            self.output.info("  (Temporarily deactivated workset for full sync)")
+
+        try:
+            result = self._do_push()
+        finally:
+            if ws_was_active:
+                try:
+                    ws_engine.activate(ws_was_active)
+                    self.output.info(f"  (Re-activated workset '{ws_was_active}')")
+                except Exception:
+                    pass
+        return result
+
+    def _do_push(self) -> int:
+        """Internal push logic."""
         dry_run = getattr(self.args, "dry_run", False)
         force = getattr(self.args, "force", False)
         yes = getattr(self.args, "yes", False)
@@ -3241,6 +3911,29 @@ class ClaudeSync:
         if not self._require_init():
             return ExitCode.NOT_INITIALIZED
 
+        # Bracket: deactivate workset so pull sees full agent/skill set
+        ws_engine = WorksetEngine(self.paths.home_claude)
+        ws_state = ws_engine.load_state()
+        ws_was_active = ws_state.active_workset if ws_state.vault_initialized else None
+        if ws_was_active:
+            ws_engine.deactivate()
+            self.output.info("  (Temporarily deactivated workset for full sync)")
+
+        try:
+            result = self._do_pull()
+        finally:
+            if ws_was_active:
+                # Re-sync vault from newly pulled files, then re-activate
+                try:
+                    ws_engine._reconcile_vault()
+                    ws_engine.activate(ws_was_active)
+                    self.output.info(f"  (Re-activated workset '{ws_was_active}')")
+                except Exception:
+                    pass
+        return result
+
+    def _do_pull(self) -> int:
+        """Internal pull logic."""
         dry_run = getattr(self.args, "dry_run", False)
         yes = getattr(self.args, "yes", False)
         ours = getattr(self.args, "ours", False)
@@ -4497,6 +5190,296 @@ class ClaudeSync:
         diff_result.deleted = [c for c in diff_result.deleted if c.path != derived]
         diff_result.conflicted = [c for c in diff_result.conflicted if c.path != derived]
         return True
+
+
+    # ---- Workset commands ----
+
+    def _cmd_workset(self) -> int:
+        """Manage agent/skill worksets."""
+        sub = getattr(self.args, "workset_command", None)
+        if not sub:
+            # Default: show status + list
+            return self._workset_status_and_list()
+
+        workset_handlers = {
+            "init": self._workset_init,
+            "create": self._workset_create,
+            "show": self._workset_show,
+            "list": self._workset_list,
+            "activate": self._workset_activate,
+            "deactivate": self._workset_deactivate,
+            "delete": self._workset_delete,
+            "status": self._workset_status,
+            "suggest": self._workset_suggest,
+        }
+        handler = workset_handlers.get(sub)
+        if handler:
+            return handler()
+        self.output.error(f"Unknown workset command: {sub}")
+        return ExitCode.ERROR
+
+    def _workset_init(self) -> int:
+        """Initialize the vault."""
+        engine = WorksetEngine(self.paths.home_claude)
+
+        # Check for interrupted activation
+        if engine.recover_if_needed():
+            self.output.warning("Recovered from interrupted activation. Full set restored.")
+
+        self.output.header("Workset Vault Initialization")
+        agent_count, skill_count = engine.init_vault()
+        self.output.success(f"Vault initialized: {agent_count} agents, {skill_count} skills")
+        self.output.info("  All agents and skills are active (full set).")
+        self.output.info("  Use 'claude-sync workset create <name>' to define worksets.")
+
+        if self.output.json_mode:
+            self.output.set_json("vault", {
+                "agents": agent_count, "skills": skill_count, "initialized": True
+            })
+        return ExitCode.OK
+
+    def _workset_create(self) -> int:
+        """Create a new workset definition."""
+        engine = WorksetEngine(self.paths.home_claude)
+        name = self.args.name
+
+        # Parse comma-separated lists
+        def csv(val):
+            return [x.strip() for x in val.split(",") if x.strip()] if val else []
+
+        ws = WorksetDefinition(
+            name=name,
+            description=getattr(self.args, "description", "") or "",
+            tags=csv(getattr(self.args, "tags", None)),
+            agents=csv(getattr(self.args, "agents", None)),
+            skills=csv(getattr(self.args, "skills", None)),
+            exclude_agents=csv(getattr(self.args, "exclude_agents", None)),
+            exclude_skills=csv(getattr(self.args, "exclude_skills", None)),
+            extends=csv(getattr(self.args, "extends", None)),
+        )
+
+        path = engine.save_definition(ws)
+        self.output.success(f"Workset '{name}' created at {path}")
+
+        # Show resolved preview
+        agents, skills = engine.resolve_workset(name)
+        self.output.info(f"  Resolves to: {len(agents)} agents, {len(skills)} skills")
+
+        if self.output.json_mode:
+            self.output.set_json("workset", ws.to_dict())
+            self.output.set_json("resolved", {"agents": agents, "skills": skills})
+        return ExitCode.OK
+
+    def _workset_show(self) -> int:
+        """Show a workset definition and resolved contents."""
+        engine = WorksetEngine(self.paths.home_claude)
+        name = self.args.name
+        definitions = engine.load_definitions()
+
+        if name not in definitions:
+            self.output.error(f"Workset '{name}' not found.")
+            return ExitCode.ERROR
+
+        ws = definitions[name]
+        self.output.header(f"Workset: {name}")
+        if ws.description:
+            self.output.info(f"  Description: {ws.description}")
+        if ws.tags:
+            self.output.info(f"  Tags: {', '.join(ws.tags)}")
+        if ws.agents:
+            self.output.info(f"  Agents: {', '.join(ws.agents)}")
+        if ws.skills:
+            self.output.info(f"  Skills: {', '.join(ws.skills)}")
+        if ws.exclude_agents:
+            self.output.info(f"  Exclude agents: {', '.join(ws.exclude_agents)}")
+        if ws.exclude_skills:
+            self.output.info(f"  Exclude skills: {', '.join(ws.exclude_skills)}")
+        if ws.extends:
+            self.output.info(f"  Extends: {', '.join(ws.extends)}")
+
+        agents, skills = engine.resolve_workset(name, definitions)
+        self.output.info(f"\n  Resolved: {len(agents)} agents, {len(skills)} skills")
+
+        if getattr(self.args, "resolved", False):
+            self.output.info("\n  Agents:")
+            for a in agents:
+                self.output.info(f"    {a}")
+            self.output.info("\n  Skills:")
+            for s in skills:
+                self.output.info(f"    {s}")
+
+        if self.output.json_mode:
+            self.output.set_json("workset", ws.to_dict())
+            self.output.set_json("resolved", {"agents": agents, "skills": skills})
+        return ExitCode.OK
+
+    def _workset_list(self) -> int:
+        """List all defined worksets."""
+        engine = WorksetEngine(self.paths.home_claude)
+        definitions = engine.load_definitions()
+        state = engine.load_state()
+
+        if not definitions:
+            self.output.warning("No worksets defined.")
+            self.output.info("  Use 'claude-sync workset create <name>' to create one.")
+            return ExitCode.OK
+
+        self.output.header(f"Worksets ({len(definitions)})")
+        for name, ws in definitions.items():
+            active = " [ACTIVE]" if state.active_workset == name else ""
+            agents, skills = engine.resolve_workset(name, definitions)
+            desc = f" - {ws.description}" if ws.description else ""
+            self.output.info(f"  {name}{active}{desc} ({len(agents)} agents, {len(skills)} skills)")
+
+        if self.output.json_mode:
+            self.output.set_json("worksets", {n: w.to_dict() for n, w in definitions.items()})
+            self.output.set_json("active", state.active_workset)
+        return ExitCode.OK
+
+    def _workset_activate(self) -> int:
+        """Activate a workset."""
+        engine = WorksetEngine(self.paths.home_claude)
+        name = self.args.name
+
+        state = engine.load_state()
+        if not state.vault_initialized:
+            self.output.error("Vault not initialized. Run 'claude-sync workset init' first.")
+            return ExitCode.ERROR
+
+        try:
+            agent_count, skill_count = engine.activate(name)
+        except (ValueError, RuntimeError) as e:
+            self.output.error(str(e))
+            return ExitCode.ERROR
+
+        self.output.success(f"Workset '{name}' activated: {agent_count} agents, {skill_count} skills")
+        vault_ac, vault_sc = engine._count_vault()
+        self.output.info(f"  (vault total: {vault_ac} agents, {vault_sc} skills)")
+
+        if self.output.json_mode:
+            self.output.set_json("activated", {
+                "workset": name, "agents": agent_count, "skills": skill_count
+            })
+        return ExitCode.OK
+
+    def _workset_deactivate(self) -> int:
+        """Deactivate workset, restore full set."""
+        engine = WorksetEngine(self.paths.home_claude)
+        state = engine.load_state()
+
+        if not state.vault_initialized:
+            self.output.error("Vault not initialized.")
+            return ExitCode.ERROR
+
+        if not state.active_workset:
+            self.output.info("No workset is currently active (full set already loaded).")
+            return ExitCode.OK
+
+        agent_count, skill_count = engine.deactivate()
+        self.output.success(f"Deactivated. Full set restored: {agent_count} agents, {skill_count} skills")
+
+        if self.output.json_mode:
+            self.output.set_json("deactivated", {
+                "agents": agent_count, "skills": skill_count
+            })
+        return ExitCode.OK
+
+    def _workset_delete(self) -> int:
+        """Delete a workset definition."""
+        engine = WorksetEngine(self.paths.home_claude)
+        name = self.args.name
+
+        state = engine.load_state()
+        if state.active_workset == name:
+            self.output.error(f"Cannot delete active workset '{name}'. Deactivate first.")
+            return ExitCode.ERROR
+
+        if engine.delete_definition(name):
+            self.output.success(f"Workset '{name}' deleted.")
+        else:
+            self.output.error(f"Workset '{name}' not found.")
+            return ExitCode.ERROR
+        return ExitCode.OK
+
+    def _workset_status(self) -> int:
+        """Show current workset activation state."""
+        engine = WorksetEngine(self.paths.home_claude)
+        state = engine.load_state()
+
+        self.output.header("Workset Status")
+        self.output.info(f"  Vault initialized: {'yes' if state.vault_initialized else 'no'}")
+
+        if state.vault_initialized:
+            vault_ac, vault_sc = engine._count_vault()
+            self.output.info(f"  Vault: {vault_ac} agents, {vault_sc} skills")
+
+        if state.active_workset:
+            self.output.info(f"  Active workset: {state.active_workset}")
+            self.output.info(f"  Activated at: {state.activated_at}")
+            active_ac, active_sc = engine._count_active()
+            self.output.info(f"  Active: {active_ac} agents, {active_sc} skills")
+        else:
+            active_ac, active_sc = engine._count_active()
+            self.output.info(f"  Active workset: none (full set)")
+            self.output.info(f"  Active: {active_ac} agents, {active_sc} skills")
+
+        if self.output.json_mode:
+            self.output.set_json("state", state.to_dict())
+        return ExitCode.OK
+
+    def _workset_status_and_list(self) -> int:
+        """Default: show status + list."""
+        self._workset_status()
+        engine = WorksetEngine(self.paths.home_claude)
+        definitions = engine.load_definitions()
+        if definitions:
+            self.output.info("")
+            state = engine.load_state()
+            for name, ws in definitions.items():
+                active = " [ACTIVE]" if state.active_workset == name else ""
+                agents, skills = engine.resolve_workset(name, definitions)
+                desc = f" - {ws.description}" if ws.description else ""
+                self.output.info(f"  {name}{active}{desc} ({len(agents)} agents, {len(skills)} skills)")
+        return ExitCode.OK
+
+    def _workset_suggest(self) -> int:
+        """Suggest a workset based on project context."""
+        engine = WorksetEngine(self.paths.home_claude)
+        state = engine.load_state()
+
+        if not state.vault_initialized:
+            self.output.error("Vault not initialized.")
+            return ExitCode.ERROR
+
+        result = engine.suggest_workset()
+        if not result:
+            self.output.info("No suggestion available. Use more worksets to build affinity data.")
+            return ExitCode.OK
+
+        name, confidence, reason = result
+        pct = int(confidence * 100)
+        self.output.header(f"Suggested workset: {name} ({pct}% confidence)")
+        self.output.info(f"  Reason: {reason}")
+
+        auto = getattr(self.args, "auto", False)
+        if auto and confidence >= 0.8:
+            try:
+                agent_count, skill_count = engine.activate(name)
+                self.output.success(f"Auto-activated '{name}': {agent_count} agents, {skill_count} skills")
+            except (ValueError, RuntimeError) as e:
+                self.output.error(f"Auto-activation failed: {e}")
+                return ExitCode.ERROR
+        elif auto:
+            self.output.info(f"  Confidence too low for auto-activation ({pct}% < 80%). Use manually:")
+            self.output.info(f"    claude-sync workset activate {name}")
+        else:
+            self.output.info(f"  To activate: claude-sync workset activate {name}")
+
+        if self.output.json_mode:
+            self.output.set_json("suggestion", {
+                "workset": name, "confidence": confidence, "reason": reason
+            })
+        return ExitCode.OK
 
 
 # =============================================================================
