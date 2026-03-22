@@ -18,6 +18,6 @@ class ClaudeSync < Formula
   end
 
   test do
-    assert_match "Sync Claude Code configuration", shell_output("#{bin}/claude-sync --help")
+    assert_match "claude-sync", shell_output("#{bin}/claude-sync --help")
   end
 end

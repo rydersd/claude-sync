@@ -3748,7 +3748,6 @@ class ClaudeSync:
         subparsers.add_parser("version", help="Quick sync version check (fingerprint comparison)")
 
         # release
-        # release
         release_p = subparsers.add_parser("release", help="Tag and release to Homebrew tap")
         release_p.add_argument("version_tag", help="Version tag (e.g. v1.4.0)")
         release_p.add_argument("--source-repo",
@@ -3763,7 +3762,7 @@ class ClaudeSync:
         install_p.add_argument("--rule", help="Install specific rule by name")
         install_p.add_argument("--list", action="store_true", help="List available items without installing")
         install_p.add_argument("--all", action="store_true", help="Install all agents, skills, and rules")
-        install_p.add_argument("--no-review", action="store_true", help="Skip overlap review")
+        install_p.add_argument("--force", action="store_true", help="Overwrite existing items without review")
         install_p.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
 
         # uninstall
@@ -5964,7 +5963,16 @@ class ClaudeSync:
             self.output.info("Release cancelled.")
             return ExitCode.OK
 
-        # 5. Get GitHub repo from remote
+        # 5. Verify we're on the default branch and get GitHub repo from remote
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=str(source_repo),
+        )
+        current_branch = result.stdout.strip()
+        if current_branch not in ("main", "master"):
+            self.output.error(f"Release must be run from main/master branch (currently on '{current_branch}').")
+            return ExitCode.ERROR
+
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             capture_output=True, text=True, timeout=10, cwd=str(source_repo),
@@ -5978,7 +5986,7 @@ class ClaudeSync:
             self.output.error(f"Could not parse GitHub repo from: {remote_url}")
             return ExitCode.ERROR
 
-        # 6. Update formula with version (before tagging, so it's in the tag)
+        # 6. Update formula URL (sha256 will be filled after tagging)
         archive_url = f"https://github.com/{github_repo}/archive/refs/tags/{version}.tar.gz"
         formula_text = formula_path.read_text()
         formula_text = re.sub(
@@ -5986,7 +5994,7 @@ class ClaudeSync:
             f'url "{archive_url}"',
             formula_text,
         )
-        # Set sha256 to PLACEHOLDER — will update after tag is pushed
+        # Temporarily set PLACEHOLDER — will be replaced after we know the hash
         formula_text = re.sub(
             r'sha256 "[^"]*"',
             'sha256 "PLACEHOLDER"',
@@ -5994,7 +6002,7 @@ class ClaudeSync:
         )
         formula_path.write_text(formula_text)
 
-        # 7. Commit formula update, tag, push
+        # 7. Commit formula URL update, tag, push tag to generate archive
         self.output.info("  Tagging...")
         subprocess.run(["git", "add", "Formula/claude-sync.rb"], check=True, cwd=str(source_repo))
         subprocess.run(
@@ -6002,26 +6010,37 @@ class ClaudeSync:
             check=True, cwd=str(source_repo),
         )
         subprocess.run(["git", "tag", version], check=True, cwd=str(source_repo))
-        subprocess.run(["git", "push", "origin", "main", "--tags"], check=True, cwd=str(source_repo))
+        subprocess.run(["git", "push", "origin", current_branch, "--tags"], check=True, cwd=str(source_repo))
 
-        # 8. Download archive and compute sha256
+        # 8. Download archive and compute sha256 (retry with backoff)
         self.output.info("  Computing archive hash...")
-        time.sleep(2)  # Brief pause for GitHub to generate the archive
+        sha256_hash = None
         with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            urllib.request.urlretrieve(archive_url, tmp_path)
-            sha = hashlib.sha256()
-            with open(tmp_path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha.update(chunk)
-            sha256_hash = sha.hexdigest()
+            for attempt in range(5):
+                time.sleep(1 + attempt * 2)  # 1s, 3s, 5s, 7s, 9s
+                try:
+                    urllib.request.urlretrieve(archive_url, tmp_path)
+                    sha = hashlib.sha256()
+                    with open(tmp_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            sha.update(chunk)
+                    sha256_hash = sha.hexdigest()
+                    break
+                except Exception:
+                    if attempt == 4:
+                        raise
+                    self.output.detail(f"    Archive not ready, retrying ({attempt + 2}/5)...")
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
         self.output.info(f"  SHA256: {sha256_hash}")
 
         # 9. Update formula with real sha256, commit, push
+        #    Note: The formula in the tagged commit has PLACEHOLDER, but that's OK —
+        #    Homebrew uses the formula from the tap's default branch, not from the tag.
+        #    The tag only provides the source archive.
         formula_text = formula_path.read_text()
         formula_text = formula_text.replace('sha256 "PLACEHOLDER"', f'sha256 "{sha256_hash}"')
         formula_path.write_text(formula_text)
@@ -6031,7 +6050,7 @@ class ClaudeSync:
             ["git", "commit", "-m", f"Update formula sha256 for {version}"],
             check=True, cwd=str(source_repo),
         )
-        subprocess.run(["git", "push", "origin", "main"], check=True, cwd=str(source_repo))
+        subprocess.run(["git", "push", "origin", current_branch], check=True, cwd=str(source_repo))
 
         self.output.success(f"Released {version}")
         self.output.info(f"  Install: brew tap rydersd/claude-sync && brew install claude-sync")
@@ -6051,15 +6070,22 @@ class ClaudeSync:
     @staticmethod
     def _parse_github_source(source: str) -> Tuple[str, str]:
         """Parse 'owner/repo' or GitHub URL into (owner, repo)."""
+        _GITHUB_NAME_RE = re.compile(r'^[a-zA-Z0-9._-]+$')
         # Full URL
         m = re.match(r'https?://github\.com/([^/]+)/([^/]+?)(?:\.git|/|$)', source)
         if m:
-            return m.group(1), m.group(2)
-        # owner/repo shorthand
-        parts = source.strip("/").split("/")
-        if len(parts) == 2:
-            return parts[0], parts[1]
-        raise ValueError(f"Cannot parse source: {source}. Use owner/repo or a GitHub URL.")
+            owner, repo = m.group(1), m.group(2)
+        else:
+            # owner/repo shorthand
+            parts = source.strip("/").split("/")
+            if len(parts) == 2:
+                owner, repo = parts[0], parts[1]
+            else:
+                raise ValueError(f"Cannot parse source: {source}. Use owner/repo or a GitHub URL.")
+        # Validate to prevent path traversal in API calls
+        if not _GITHUB_NAME_RE.match(owner) or not _GITHUB_NAME_RE.match(repo):
+            raise ValueError(f"Invalid owner/repo: {owner}/{repo}. Names must match [a-zA-Z0-9._-]+")
+        return owner, repo
 
     @staticmethod
     def _fetch_github_contents(owner: str, repo: str, path: str = "") -> list:
@@ -6077,6 +6103,7 @@ class ClaudeSync:
         # Fallback to urllib
         try:
             import urllib.request
+            import urllib.error
             url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
             req = urllib.request.Request(url, headers={
                 "Accept": "application/vnd.github.v3+json",
@@ -6084,13 +6111,22 @@ class ClaudeSync:
             })
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read())
-        except Exception:
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return []  # Directory doesn't exist — expected
+            # Rate-limit, auth, server errors — surface to caller
+            import sys
+            print(f"Warning: GitHub API error {e.code} for {path}: {e.reason}", file=sys.stderr)
+            return []
+        except Exception as e:
+            import sys
+            print(f"Warning: Failed to fetch {path}: {e}", file=sys.stderr)
             return []
 
     @staticmethod
     def _fetch_raw_file(owner: str, repo: str, path: str) -> str:
         """Fetch raw file content from GitHub. Uses gh CLI if available."""
-        # Try gh CLI first
+        # Try gh CLI first (uses repo's default branch automatically)
         try:
             result = subprocess.run(
                 ["gh", "api", f"repos/{owner}/{repo}/contents/{path}",
@@ -6099,14 +6135,25 @@ class ClaudeSync:
             )
             if result.returncode == 0 and result.stdout.strip():
                 import base64
-                return base64.b64decode(result.stdout.strip()).decode("utf-8")
+                return base64.b64decode(result.stdout.strip()).decode("utf-8", errors="replace")
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-        # Fallback to urllib
+        # Fallback to urllib — use contents API (respects default branch) instead of raw.githubusercontent.com
         import urllib.request
-        url = f"https://raw.githubusercontent.com/{owner}/{repo}/main/{path}"
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            return resp.read().decode("utf-8")
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "claude-sync",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            import base64
+            data = json.loads(resp.read())
+            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _is_safe_name(name: str) -> bool:
+        """Check that a name is safe for use as a filename (no path traversal)."""
+        return bool(name) and ".." not in name and "/" not in name and "\\" not in name and name == name.strip()
 
     def _discover_remote_items(self, owner: str, repo: str) -> Dict[str, List[dict]]:
         """Discover available agents, skills, and rules in a remote repo."""
@@ -6118,9 +6165,12 @@ class ClaudeSync:
                 contents = self._fetch_github_contents(owner, repo, f"{prefix}{category}")
                 if contents:
                     for entry in contents:
-                        if entry.get("type") == "file" and entry["name"].endswith(".md"):
+                        name = entry.get("name", "")
+                        if not self._is_safe_name(name):
+                            continue  # Skip entries with suspicious names
+                        if entry.get("type") == "file" and name.endswith(".md"):
                             items[category].append({
-                                "name": entry["name"].replace(".md", ""),
+                                "name": name.replace(".md", ""),
                                 "path": entry["path"],
                                 "size": entry.get("size", 0),
                             })
@@ -6130,7 +6180,7 @@ class ClaudeSync:
                             for s in sub:
                                 if s.get("name") == "SKILL.md":
                                     items[category].append({
-                                        "name": entry["name"],
+                                        "name": name,
                                         "path": s["path"],
                                         "size": s.get("size", 0),
                                         "is_dir": True,
@@ -6153,7 +6203,7 @@ class ClaudeSync:
         """Install agents/skills from a GitHub repo."""
         source = self.args.source
         list_only = getattr(self.args, "list", False)
-        no_review = getattr(self.args, "no_review", False)
+        force = getattr(self.args, "force", False)
         yes = getattr(self.args, "yes", False)
         target_agent = getattr(self.args, "agent", None)
         target_skill = getattr(self.args, "skill", None)
@@ -6212,7 +6262,7 @@ class ClaudeSync:
             overlap = self._check_overlap(name, category)
 
             # Review step
-            if overlap and not no_review:
+            if overlap and not force:
                 self.output.warning(f"\n  Overlap: {name} already exists in {category}/")
                 if not yes:
                     response = input("    [r]eplace, [s]kip, [b]oth (prefix)? [s] ").strip().lower()
@@ -6223,6 +6273,10 @@ class ClaudeSync:
                         # Install with prefix
                         name = f"{repo}-{name}"
                     # 'r' = replace, fall through
+                else:
+                    self.output.detail(f"    Replacing existing {category}/{name}")
+            elif overlap and force:
+                self.output.detail(f"    Overwriting {category}/{name} (--force)")
 
             # Fetch content
             try:
@@ -6238,11 +6292,16 @@ class ClaudeSync:
                 body = content[fm_match.end():]
                 # Remove any existing installed_from lines
                 fm_lines = [l for l in fm.split('\n') if not l.startswith('installed_from:') and not l.startswith('installed_at:')]
-                fm_lines.append(f"installed_from: {owner}/{repo}")
+                # Sanitize provenance value (no newlines, no YAML injection)
+                safe_source = f"{owner}/{repo}".replace("\n", "").replace("\r", "")
+                fm_lines.append(f"installed_from: {safe_source}")
                 fm_lines.append(f"installed_at: {_utcnow_iso()}")
                 content = f"---\n" + "\n".join(fm_lines) + f"\n---{body}"
 
-            # Write to disk
+            # Write to disk (with path traversal guard)
+            if not self._is_safe_name(name):
+                self.output.warning(f"  Skipped {name}: unsafe name")
+                continue
             if item.get("is_dir"):
                 dest_dir = self.paths.home_claude / category / name
                 dest_dir.mkdir(parents=True, exist_ok=True)
@@ -6250,6 +6309,11 @@ class ClaudeSync:
             else:
                 dest = self.paths.home_claude / category / f"{name}.md"
                 dest.parent.mkdir(parents=True, exist_ok=True)
+            # Verify resolved path stays under expected directory
+            expected_parent = (self.paths.home_claude / category).resolve()
+            if not dest.resolve().is_relative_to(expected_parent):
+                self.output.warning(f"  Skipped {name}: path escapes {category}/")
+                continue
 
             dest.write_text(content, encoding="utf-8")
             installed += 1
@@ -6293,18 +6357,28 @@ class ClaudeSync:
                         removed += 1
                         self.output.detail(f"  Removed {category}/{item.name}")
         elif name:
-            # Remove by name across all categories
+            # Remove by name across all categories — find matches first
             self.output.header(f"Uninstall: {name}")
+            matches: list = []
             for category in ["agents", "skills", "rules"]:
                 cat_dir = self.paths.home_claude / category
                 for candidate in [cat_dir / f"{name}.md", cat_dir / name]:
                     if candidate.exists():
-                        if candidate.is_dir():
-                            shutil.rmtree(candidate)
-                        else:
-                            candidate.unlink()
-                        removed += 1
-                        self.output.detail(f"  Removed {category}/{candidate.name}")
+                        matches.append((category, candidate))
+            if len(matches) > 1:
+                self.output.warning(f"  Found {len(matches)} items named '{name}':")
+                for cat, path in matches:
+                    self.output.info(f"    {cat}/{path.name}")
+                if not self.output.confirm("Remove all?"):
+                    self.output.info("Cancelled.")
+                    return ExitCode.OK
+            for category, candidate in matches:
+                if candidate.is_dir():
+                    shutil.rmtree(candidate)
+                else:
+                    candidate.unlink()
+                removed += 1
+                self.output.detail(f"  Removed {category}/{candidate.name}")
 
         if removed:
             self.output.success(f"Removed {removed} item(s)")
