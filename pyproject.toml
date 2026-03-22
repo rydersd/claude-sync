@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-sync"
-version = "1.0.0"
+version = "1.1.0"
 description = "Sync Claude Code configuration between machines via git"
 readme = "README.md"
 license = "MIT"
