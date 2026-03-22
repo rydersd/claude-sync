@@ -418,7 +418,16 @@ class DiffEngine:
                     continue
 
                 # Target changed, source unchanged from base -> skip (other side is ahead)
+                # BUT if target is None (file missing), restore it from source
                 if base_h == src_h and base_h != tgt_h:
+                    if tgt_h is None:
+                        result.added.append(FileChange(
+                            path=path, change_type="added",
+                            home_hash=home_h, repo_hash=repo_h, base_hash=base_h,
+                        ))
+                    else:
+                        continue
+
                     continue
 
                 # File deleted on source side, unchanged on target
@@ -429,8 +438,12 @@ class DiffEngine:
                     ))
                     continue
 
-                # File deleted on target side, unchanged on source -> skip
+                # File deleted on target side, unchanged on source -> restore it
                 if tgt_h is None and base_h == src_h and base_h is not None:
+                    result.added.append(FileChange(
+                        path=path, change_type="added",
+                        home_hash=home_h, repo_hash=repo_h, base_hash=base_h,
+                    ))
                     continue
 
             # Two-way fallback (no base, or base is None for new files)
