@@ -83,6 +83,7 @@ This installs the `claude-sync` command globally via the `pyproject.toml` entry 
 | `ecosystem` | Analyze agents/skills: `duplicates`, `related`, `catalog`, `stats`, `stale`, `timeline`. |
 | `genome` | Skill dependency management: `scan`, `health`, `graph`, `install`, `extract-triggers`, `assemble-triggers`, `package`. |
 | `drift` | Compare local state against known machine versions. |
+| `workset` | Manage agent/skill worksets: `init`, `create`, `activate`, `deactivate`, `list`, `show`, `delete`, `status`, `suggest`. |
 
 ### Global Flags
 
@@ -222,6 +223,176 @@ claude-sync genome install figma-to-code
   Proceed with install? [y/N]
 ```
 
+## Worksets
+
+Worksets let you activate subsets of agents and skills per session, so you don't load all 179 agents when you only need 45 for Xcode development.
+
+### How It Works
+
+1. **Vault**: A one-time `workset init` copies all agents/skills into `~/.claude/.workset-vault/`
+2. **Activation**: `workset activate dev-xcode` populates `~/.claude/agents/` and `~/.claude/skills/` with hardlinks to only that workset's files
+3. **Deactivation**: `workset deactivate` restores the full set
+
+Hardlinks mean zero disk overhead and ~50ms activation. Claude Code only sees what's in the active directories.
+
+### Quick Start
+
+```bash
+# One-time setup
+claude-sync workset init
+
+# Create a workset
+claude-sync workset create dev-xcode \
+  --tags "Dev" \
+  --agents "apple-dev-expert,swift-test-writer,xcode-workspace-surgeon" \
+  --description "Apple platform development"
+
+# Activate before launching Claude Code
+claude-sync workset activate dev-xcode
+
+# Check what's loaded
+claude-sync workset status
+
+# Restore full set
+claude-sync workset deactivate
+```
+
+### Workset Definition Format
+
+```json
+{
+  "name": "dev-xcode",
+  "description": "Apple platform development",
+  "tags": ["Dev"],
+  "agents": ["apple-dev-expert", "swift-test-writer"],
+  "skills": ["visual-explainer"],
+  "exclude_agents": [],
+  "exclude_skills": [],
+  "extends": ["dev-core"]
+}
+```
+
+- **tags**: Include all agents with matching tags
+- **agents/skills**: Explicit inclusions
+- **exclude_agents/exclude_skills**: Remove specific items after tag expansion
+- **extends**: Inherit from parent worksets (recursive, cycle-detected)
+
+Resolution order: extends → tags → explicit → dependency resolution → excludes.
+
+### Commands
+
+```bash
+claude-sync workset init                     # One-time vault migration
+claude-sync workset create <name>            # Create (--tags, --agents, --skills, --extends, -d)
+claude-sync workset activate <name>          # Load subset
+claude-sync workset deactivate              # Restore full set
+claude-sync workset list                    # Show all with counts
+claude-sync workset show <name> --resolved  # Show resolved agent/skill list
+claude-sync workset status                  # Current state
+claude-sync workset delete <name>           # Remove definition
+claude-sync workset suggest                 # Auto-suggest based on project
+claude-sync workset suggest --auto          # Auto-activate if confidence > 80%
+```
+
+### Project Affinity Engine
+
+Every `workset activate` records the git remote, detected languages, and workset name. Over time, `workset suggest` learns which worksets you use per project:
+
+```bash
+cd ~/projects/my-ios-app
+claude-sync workset suggest
+# → Suggested workset: dev-xcode (100% confidence)
+#   Reason: Used 12/12 times for github.com/user/my-ios-app
+```
+
+### Sync Safety
+
+When a workset is active, `push` and `pull` automatically deactivate it first (so sync sees the full set), then re-activate after. Zero changes to existing sync logic.
+
+Workset definitions (`~/.claude/worksets/*.json`) are synced across machines. The vault (`.workset-vault/`) and activation state (`_state.json`) are machine-local.
+
+### New Machine Setup
+
+```bash
+# On the new machine, after git pull + claude-sync pull:
+claude-sync workset init                    # Build the vault
+claude-sync workset list                    # See available worksets
+claude-sync workset activate dev-xcode      # Load what you need
+```
+
+## Claude Desktop Integration (MCP Server)
+
+`claude-sync-mcp.py` is a stdio-based MCP server that bridges your agent/skill ecosystem to Claude Desktop. Same agents, same skills, same worksets — accessible from the GUI app.
+
+### Setup
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "claude-sync": {
+      "command": "python3",
+      "args": ["/path/to/claude-sync-mcp.py"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The `claude-sync` MCP server appears with 7 tools and user-invocable skill prompts.
+
+### Tools
+
+| Tool | What it does |
+|------|-------------|
+| `search_agents(query)` | Fuzzy search agents by name/description/tags |
+| `get_agent(name)` | Full agent content |
+| `get_skill(name)` | Full skill content |
+| `list_worksets()` | All worksets with counts |
+| `activate_workset(name)` | Switch workset |
+| `suggest_workset(project_path)` | Auto-suggest from affinity |
+| `consult(question, context)` | Auto-route to relevant agents, extract pertinent sections |
+
+### consult — Automatic Expertise Routing
+
+Instead of manually looking up agents, `consult` auto-routes your question to the 1-3 most relevant agents and extracts only the pertinent sections:
+
+```
+You: consult("how do I test async Swift code with actors")
+
+→ [From: swift-testing-expert]
+  ## Core Expertise
+  Swift Testing Framework: @Test, @Suite, #expect, parallel by default...
+
+  [From: concurrency-hygiene-advisor]
+  ## Decision Heuristics
+  If UI-facing code: prefer @MainActor at the method...
+```
+
+Consultations are logged to `~/.claude/mcp-consult.log` for data-driven agent curation.
+
+### Resources
+
+- `workset://system-prompt` — compressed system prompt from active workset's top agents
+- `workset://active` — current workset state
+- `agent://{name}` — full agent content
+- `skill://{name}` — full skill content
+
+### New Machine Setup
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/your/claudeTools.git
+
+# 2. Sync your config
+cd your-sync-repo && claude-sync pull
+
+# 3. Add MCP server to Claude Desktop config
+# (edit ~/Library/Application Support/Claude/claude_desktop_config.json)
+
+# 4. Restart Claude Desktop
+```
+
 ## Sync Flow
 
 ```
@@ -254,6 +425,7 @@ claude-sync genome install figma-to-code
 | `rules/` | Rule files |
 | `hooks/` | Hook scripts (shell + TypeScript) |
 | `scripts/` | MCP and utility scripts |
+| `worksets/` | Workset definitions (JSON) |
 
 ### Never Synced (EXCLUDE_PATHS)
 
@@ -279,6 +451,9 @@ These stay local to each machine and are never copied:
 | `file-history/` | File access history |
 | `debug/` | Debug logs |
 | `statsig/` | Feature flag state |
+| `.workset-vault/` | Local agent/skill vault (workset mechanism) |
+| `worksets/_state.json` | Machine-local workset activation state |
+| `worksets/_affinity.json` | Machine-local project affinity data |
 
 ## Settings.json Handling
 
