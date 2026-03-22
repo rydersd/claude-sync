@@ -40,8 +40,27 @@ SKILLS_DIR = HOME_CLAUDE / "skills"
 VAULT_DIR = HOME_CLAUDE / ".workset-vault"
 WORKSETS_DIR = HOME_CLAUDE / "worksets"
 
-# Repo location (for git-tracked copy)
-REPO_SKILLS = Path.home() / "Documents" / "GitHub" / "rydersClaude" / "claude" / "skills"
+# Repo location (for git-tracked copy) — auto-detect from git or fall back to env var
+def _find_repo_skills() -> Optional[Path]:
+    """Find the claude-sync repo's skills dir by walking up from cwd or checking env."""
+    # Check CLAUDE_SYNC_REPO env var first
+    env_repo = os.environ.get("CLAUDE_SYNC_REPO")
+    if env_repo:
+        p = Path(env_repo) / "claude" / "skills"
+        if p.exists():
+            return p
+
+    # Walk up from cwd looking for claude/skills/ with a manifest.json
+    cwd = Path.cwd()
+    for parent in [cwd, *cwd.parents]:
+        candidate = parent / "claude" / "skills"
+        manifest = parent / "manifest.json"
+        if candidate.exists() and manifest.exists():
+            return candidate
+
+    return None
+
+REPO_SKILLS = _find_repo_skills()
 
 # Stub detection: skills at exactly these line counts are stubs
 STUB_LINE_COUNTS = {26, 27}
@@ -430,8 +449,9 @@ def write_skill(name: str, content: str, dry_run: bool = False) -> List[str]:
     paths = [
         SKILLS_DIR / name / "SKILL.md",
         VAULT_DIR / "skills" / name / "SKILL.md",
-        REPO_SKILLS / name / "SKILL.md",
     ]
+    if REPO_SKILLS:
+        paths.append(REPO_SKILLS / name / "SKILL.md")
 
     written = []
     for p in paths:
