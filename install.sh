@@ -1,10 +1,15 @@
 #!/bin/bash
-# Quick install script for claude-sync
+# Install script for claude-sync
 # Usage: curl -fsSL https://raw.githubusercontent.com/rydersd/claude-sync/main/install.sh | bash
+#
+# Or inspect before running:
+#   curl -fsSL https://raw.githubusercontent.com/rydersd/claude-sync/main/install.sh -o install.sh
+#   less install.sh
+#   bash install.sh
 
 set -e
 
-echo "Installing claude-sync..."
+echo "Setting up claude-sync..."
 
 # Check for Homebrew
 if ! command -v brew &>/dev/null; then
@@ -16,7 +21,9 @@ fi
 # Remove old tap if present
 if brew tap | grep -q "rydersd/tools"; then
     echo "Removing old rydersd/tools tap..."
-    brew untap rydersd/tools 2>/dev/null || true
+    if ! brew untap rydersd/tools 2>&1; then
+        echo "Warning: Could not remove old tap. You may need: brew untap rydersd/tools --force"
+    fi
 fi
 
 # Tap repo
@@ -28,14 +35,14 @@ fi
 # Install or upgrade
 if brew list claude-sync &>/dev/null; then
     echo "Upgrading claude-sync..."
-    brew upgrade claude-sync
+    brew upgrade claude-sync || echo "Already up-to-date."
 else
     echo "Installing claude-sync..."
     brew install claude-sync
 fi
 
 echo ""
-echo "Installed: $(which claude-sync)"
+echo "Installed: $(command -v claude-sync)"
 echo ""
 echo "Quick start:"
 echo "  cd your-git-repo"

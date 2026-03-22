@@ -4,7 +4,7 @@ class ClaudeSync < Formula
   desc "Sync Claude Code configuration between machines via git"
   homepage "https://github.com/rydersd/claude-sync"
   url "https://github.com/rydersd/claude-sync/archive/refs/tags/v1.4.0.tar.gz"
-  sha256 "PLACEHOLDER"
+  sha256 "39ef1f666d98b5f01439bf4c6c4164b2ad0613c3d04505405fe4a2180756ea1e"
   license "MIT"
   head "https://github.com/rydersd/claude-sync.git", branch: "main"
 
