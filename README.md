@@ -1,8 +1,23 @@
 # claude-sync
 
-Sync your Claude Code configuration between machines using git.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
+[![Zero Dependencies](https://img.shields.io/badge/Dependencies-zero-green.svg)](#)
+
+Sync your Claude Code configuration between machines using git. Manage agent/skill worksets for selective loading. Bridge your ecosystem to Claude Desktop via MCP.
 
 Claude Code stores its configuration in `~/.claude/` -- rules, agents, hooks, skills, scripts, and `CLAUDE.md`. That directory is local to each machine. **claude-sync** copies the portable parts into a git repo's `claude/` directory so you can push, pull, and share your setup across laptops, desktops, and CI environments.
+
+## Features
+
+- **Sync** -- Push/pull `~/.claude/` config to any git repo with three-way merge, secret scanning, and automatic backups
+- **Worksets** -- Activate subsets of agents/skills per session (load 45 instead of 179) with hardlink-based vault mechanism
+- **Affinity Engine** -- Learns which worksets you use per project and auto-suggests the right one
+- **MCP Server** -- Bridges agents/skills to Claude Desktop with `consult` (auto-routes questions to relevant agent expertise)
+- **Skill Genome** -- Dependency management for skills (npm-style `requires:` declarations, health checks, packaging)
+- **Ecosystem Analysis** -- Find duplicates, related files, stale content, and evolution timeline across your agent/skill library
+
+All tools are single Python files with zero external dependencies.
 
 ## Why
 
@@ -382,10 +397,10 @@ Consultations are logged to `~/.claude/mcp-consult.log` for data-driven agent cu
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your/claudeTools.git
+git clone https://github.com/rydersd/claudeTools.git
 
-# 2. Sync your config
-cd your-sync-repo && claude-sync pull
+# 2. Sync your config (from whatever repo you initialized claude-sync in)
+cd ~/projects/my-repo && claude-sync pull
 
 # 3. Add MCP server to Claude Desktop config
 # (edit ~/Library/Application Support/Claude/claude_desktop_config.json)
