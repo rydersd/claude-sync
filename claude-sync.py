@@ -123,6 +123,7 @@ EXCLUDE_PATHS = [
     "worksets/_affinity.json",
     "teams/",
     "tasks/",
+    "plugins/cache/",
 ]
 
 # Exclusion patterns for tree walking
@@ -131,6 +132,8 @@ WALK_EXCLUDE_PATTERNS = [
     "__pycache__",
     ".pyc",
     ".DS_Store",
+    ".git",
+    ".github",
     "*.swp",
     "*.swo",
     "*~",
