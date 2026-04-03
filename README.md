@@ -165,19 +165,45 @@ tracker   add <url>            Add a tracker server
           list                 List configured trackers
           enable <name>        Enable a tracker
           disable <name>       Disable a tracker
-pair      <device>             Pair with a remote device
+pair      [device_id]          Pair with a remote device
+          --code CODE          Pairing code from the other device
 version                        Show sync version and fingerprint
-release   [--tag TAG]          Tag, compute sha256, update Homebrew formula
-install   --from <github-url>  Pull agents/skills/rules from a public repo
-          --force              Skip overlap confirmation
-uninstall <name>               Remove by name
-          --from <source>      Remove all items from a source
+release   <version_tag>        Tag, compute sha256, update Homebrew formula
+          --source-repo PATH   Path to source code repo (auto-detected)
+          --yes, -y            Skip confirmation
+install   <source>             GitHub repo (owner/name) or URL
+          --agent NAME         Install specific agent by name
+          --skill NAME         Install specific skill by name
+          --rule NAME          Install specific rule by name
+          --list               List available items without installing
+          --all                Install all agents, skills, and rules
+          --force              Overwrite existing without review
+          --yes, -y            Skip confirmation
+uninstall [name]               Remove by name
+          --from <source>      Remove all items from a source repo
 search    <query>              Full-text TF-IDF search across ecosystem
-update    --check              Check for newer versions of installed items
-compose   <agent1> <agent2>    Merge agents into a composite
-          --name <name>        Name for the composite agent
-audit                          Run security and quality scoring
-hub       browse               Discover and browse community agent repos
+          --type TYPE          Filter by type (agent/skill/rule/all)
+          --tag TAG            Filter by tag
+          --from SOURCE        Filter by provenance (owner/repo)
+          --limit N            Max results (default: 20)
+update    [name]               Check/apply updates for a specific item
+          --all                Update all installed items
+          --dry-run            Show changes without applying
+          --yes, -y            Skip confirmation
+compose   <name>               Name for the composite
+          --agents A,B,C       Comma-separated agent names to merge
+          --skills A,B,C       Comma-separated skill names to merge
+          --type TYPE          Type of composite (agent/skill, default: agent)
+          --description TEXT   Description for the composite
+          --dry-run            Print result without writing
+audit     [name]               Audit a specific item (or all if omitted)
+          --fix                Auto-fix issues where possible
+          --severity LEVEL     Filter: all/critical/warning/info (default: all)
+hub       browse               Browse available repos
+          search <query>       Search repos by keyword
+          info <repo>          Show details for a repo
+          add <repo>           Add a repo to the hub index
+          refresh              Refresh the hub index cache
 ```
 
 ## Skill Genome
